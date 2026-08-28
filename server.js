@@ -509,6 +509,52 @@ const server = createServer(async (req, res) => {
       send(res, 200, { ok: true, port: PORT, time: ts() });
       return;
     }
+    // Debug endpoint: probe a user-supplied Cookie header against LinkedIn
+    // using the same code path as a real capture, returning the raw
+    // upstream status + body. Lets us distinguish "the extension is reading
+    // cookies wrong" from "the cookies themselves are rejected".
+    if (route === 'POST /api/debug/probe') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      const probeCourse = String(body.courseSlug || 'advanced-facebook-advertising-2021');
+      const probeVideo = String(body.videoSlug || 'learn-how-to-master-facebook-ads');
+      const cookieHeader = String(body.cookieHeader || '');
+      if (!cookieHeader) {
+        send(res, 400, { ok: false, error: 'cookieHeader required' });
+        return;
+      }
+      const csrfTokenRaw = (cookieHeader.match(/(?:^|;\s*)JSESSIONID=(?:"([^"]+)"|([^;]+))/i) || [, , ''])[1] || (cookieHeader.match(/(?:^|;\s*)JSESSIONID=(?:"([^"]+)"|([^;]+))/i) || [, , ''])[2];
+      const csrfTokenPositive = csrfTokenRaw.replace(/^ajax:-/, 'ajax:');
+      const cookieHeaderPositive = cookieHeader.replace(/(JSESSIONID="?)ajax:-/, '$1ajax:').replace(/(JSESSIONID=)ajax:-/, '$1ajax:');
+      const probeUrl = `${API_BASE}?addParagraphsToTranscript=false&q=slugs&resolution=_720&courseSlug=${probeCourse}&videoSlug=${probeVideo}`;
+      async function attempt(label, csrfToken, cookieHdr) {
+        const r = await fetch(probeUrl, {
+          headers: {
+            accept: 'application/vnd.linkedin.normalized+json+2.1',
+            'csrf-token': csrfToken,
+            'x-restli-protocol-version': '2.0.0',
+            'x-li-lang': 'en_US',
+            cookie: cookieHdr,
+            referer: `https://www.linkedin.com/learning/${probeCourse}/${probeVideo}`,
+            'user-agent': USER_AGENT,
+          },
+          redirect: 'follow',
+        });
+        const text = await r.text();
+        return {
+          label,
+          csrfTokenSent: csrfToken ? `${csrfToken.slice(0, 14)}…` : '(empty)',
+          upstreamStatus: r.status,
+          upstreamBodySnippet: text.length > 200 ? text.slice(0, 200) + '…' : text,
+        };
+      }
+      const results = [];
+      results.push(await attempt('as-given', csrfTokenRaw, cookieHeader));
+      if (csrfTokenPositive !== csrfTokenRaw) {
+        results.push(await attempt('minus-stripped', csrfTokenPositive, cookieHeaderPositive));
+      }
+      send(res, 200, { results });
+      return;
+    }
     if (route === 'GET /api/jobs') {
       const list = Array.from(jobs.values()).sort((a, b) => (b.startedAt > a.startedAt ? 1 : -1));
       send(res, 200, { jobs: list.slice(0, 200) });
