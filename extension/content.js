@@ -21,6 +21,9 @@
       sendResponse({ ok: false, error: 'unknown content-script message type' });
       return false;
     }
+    // Fire the fetch without awaiting it here — the listener must return true
+    // synchronously to keep the message channel open in MV3. The async work
+    // resolves later via sendResponse().
     (async () => {
       try {
         const { courseSlug, videoSlug, resolution } = msg;
@@ -48,7 +51,8 @@
           bodySnippet: text && text.length > 240 ? text.slice(0, 240) + '…' : text,
         });
       } catch (e) {
-        sendResponse({ ok: false, error: String(e && e.message || e) });
+        const message = e && e.message ? e.message : (typeof e === 'string' ? e : 'fetch threw (no message)');
+        sendResponse({ ok: false, error: message, name: e && e.name });
       }
     })();
     return true; // keep the message channel open for the async response.
