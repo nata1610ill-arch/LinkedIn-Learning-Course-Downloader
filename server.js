@@ -11,10 +11,10 @@
 // NOT supported: Widevine L1/L2 protected content. NOT a login bypass tool.
 
 import { createServer } from 'node:http';
-import { mkdir, stat, readdir, appendFile, rm } from 'node:fs/promises';
+import { mkdir, stat, readdir, appendFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extractVideoMetadata, findVideoObject } from './lib/linkedin-parser.js';
+import { extractVideoMetadata, extractTranscriptLines, renderSrt, findVideoObject } from './lib/linkedin-parser.js';
 import { atomicDownload, probeMedia } from './lib/media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -189,7 +189,7 @@ async function fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution
 // — it uses Voyager-style URN strings in `$type` (or no type field at all).
 // Earlier shapes used `elements: [...]`; older public downloaders still hit
 // that path sometimes. We try both.
-async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total }) {
+async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus }) {
   const jobId = `job-${++jobSeq}-${Date.now()}`;
   const job = {
     id: jobId,
@@ -213,7 +213,39 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
     job.status = 'resolving';
     let meta = null;
     let lastError = null;
-    for (const res of RESOLUTION_LADDER) {
+    // If the extension's content script already did the page-context fetch
+    // and forwarded the JSON here, skip the local LinkedIn fetch entirely —
+    // it would just hit the same anti-abuse 403 / TLS abort.
+    if (upstreamJson && typeof upstreamJson === 'object') {
+      log('INFO', 'capture', 'using upstream json from content script', { jobId, upstreamStatus });
+      const parsed = extractVideoMetadata(upstreamJson, courseSlug, videoSlug);
+      if (parsed) {
+        if (parsed.locked) {
+          job.status = 'drm_protected';
+          job.error = 'locked or subscription-required';
+          log('WARN', 'capture', 'locked', { jobId, videoSlug });
+          return job;
+        }
+        if (!parsed.progressiveUrl) {
+          job.status = 'failed';
+          job.error = 'no progressive url';
+          log('ERROR', 'capture', 'upstream had no progressive url', { jobId });
+          return job;
+        }
+        meta = { ...parsed, resolution: '_upstream' };
+        job.resolution = parsed.selectedFormat && parsed.selectedFormat.height
+          ? `${parsed.selectedFormat.height}p`
+          : 'upstream';
+        job.width = parsed.selectedFormat && parsed.selectedFormat.width;
+        job.height = parsed.selectedFormat && parsed.selectedFormat.height;
+        job.bitrate = parsed.selectedFormat && parsed.selectedFormat.bitrate;
+      } else {
+        lastError = 'no metadata (upstream)';
+        log('WARN', 'capture', 'upstream json had no metadata', { jobId });
+      }
+    }
+    if (!meta) {
+      for (const res of RESOLUTION_LADDER) {
       try {
         const result = await fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution: res });
         if (result.status !== 200) {
@@ -304,6 +336,7 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
         log('WARN', 'capture', 'fetch threw', { jobId, resolution: res, error: lastError });
       }
     }
+    } // close if (!meta) { for (...) }
     if (!meta) {
       job.status = 'failed';
       job.error = lastError || 'no usable resolution';
@@ -364,6 +397,19 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
     job.bitrate = mediaInfo.bitrate || job.bitrate;
     job.resolution = job.height ? `${job.height}p` : job.resolution;
     job.finishedAt = ts();
+    // Write English subtitles next to the MP4 if LinkedIn returned them.
+    // Captions are in meta.transcriptLines (normalised from either
+    // selectedVideo.transcript.lines or .paragraphs by the parser).
+    if (Array.isArray(meta.transcriptLines) && meta.transcriptLines.length) {
+      const srtPath = dest.replace(/\.mp4$/i, '.srt');
+      try {
+        await writeFile(srtPath, renderSrt(meta.transcriptLines), 'utf8');
+        job.subtitle = srtPath;
+        log('INFO', 'capture', 'subtitle written', { jobId, srtPath, lines: meta.transcriptLines.length });
+      } catch (e) {
+        log('WARN', 'capture', 'subtitle write failed', { jobId, error: String(e && e.message || e) });
+      }
+    }
     log('INFO', 'capture', 'done', { jobId, dest, resolution: job.resolution });
     await refreshRecentFiles();
     return job;
@@ -570,12 +616,12 @@ const server = createServer(async (req, res) => {
         return;
       }
       const body = JSON.parse((await readBody(req)) || '{}');
-      const { courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total } = body;
+      const { courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus } = body;
       if (!courseSlug || !videoSlug || !cookies || !cookies.li_at) {
         send(res, 400, { ok: false, error: 'courseSlug, videoSlug and cookies.li_at required' });
         return;
       }
-      const job = await captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total });
+      const job = await captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus });
       send(res, 200, { ok: job.status === 'done' || job.status === 'already_done', job });
       return;
     }

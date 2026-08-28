@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractVideoMetadata } from '../lib/linkedin-parser.js';
+import { extractVideoMetadata, extractTranscriptLines, renderSrt } from '../lib/linkedin-parser.js';
 
 function course(slug, videoSlug, formats) {
   return {
@@ -63,4 +63,49 @@ test('extractVideoMetadata skips a matching course node without the requested vi
     extractVideoMetadata(json, 'course', 'video').progressiveUrl,
     'https://cdn/video.mp4',
   );
+});
+
+test('extractTranscriptLines normalises .lines with ms timestamps', () => {
+  const t = { lines: [
+    { transcriptStartAt: 0, caption: 'Welcome.' },
+    { transcriptStartAt: 3500, caption: 'Today we cover…' },
+    { transcriptStartAt: 'bad', caption: '' }, // dropped (empty caption)
+  ]};
+  assert.deepEqual(extractTranscriptLines(t), [
+    { startMs: 0, caption: 'Welcome.' },
+    { startMs: 3500, caption: 'Today we cover…' },
+  ]);
+});
+
+test('extractTranscriptLines falls back to .paragraphs when .lines absent', () => {
+  const t = { paragraphs: [
+    { transcriptStartAt: 1000, caption: 'First.' },
+    { transcriptStartAt: 2500, caption: 'Second.' },
+  ]};
+  assert.deepEqual(extractTranscriptLines(t).map((l) => l.caption), ['First.', 'Second.']);
+});
+
+test('renderSrt produces 1-indexed SRT with HH:MM:SS,mmm timestamps', () => {
+  const srt = renderSrt([
+    { startMs: 0, caption: 'Hello.' },
+    { startMs: 3_600_000 + 5_000, caption: 'Mid.' },
+    { startMs: 999, endMs: 1500, caption: 'Quick.' },
+  ]);
+  assert.ok(srt.startsWith('1\n00:00:00,000 --> 00:00:02,000\nHello.\n\n'));
+  assert.ok(srt.includes('2\n01:00:05,000 --> 01:00:07,000\nMid.'));
+  assert.ok(srt.includes('3\n00:00:00,999 --> 00:00:01,500\nQuick.'));
+});
+
+test('extractVideoMetadata surfaces transcriptLines', () => {
+  const json = { included: [{
+    slug: 'course',
+    selectedVideo: {
+      slug: 'video',
+      formats: [{ type: 'progressive', url: 'https://cdn/v.mp4', height: 720 }],
+      transcript: { lines: [{ transcriptStartAt: 0, caption: 'hi' }] },
+    },
+  }]};
+  const md = extractVideoMetadata(json, 'course', 'video');
+  assert.equal(md.progressiveUrl, 'https://cdn/v.mp4');
+  assert.deepEqual(md.transcriptLines, [{ startMs: 0, caption: 'hi' }]);
 });

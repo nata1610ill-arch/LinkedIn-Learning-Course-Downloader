@@ -15,6 +15,29 @@ async function pingServer() {
   }
 }
 
+// Ask the active LinkedIn Learning tab to perform the /learning-api/detailedCourses
+// fetch from the page context. The page's fetch rides the same TLS/network path
+// and cookie jar as the page itself — LinkedIn's edge can't fingerprint it as
+// out-of-band. We fall back to the server-side path if no LinkedIn tab is open
+// (e.g. captures triggered programmatically).
+async function fetchDetailedCoursesFromActiveTab({ courseSlug, videoSlug, resolution }) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.url || !/linkedin\.com\/learning/.test(tab.url)) {
+    return { ok: false, error: 'no active linkedin.com/learning tab' };
+  }
+  try {
+    const resp = await chrome.tabs.sendMessage(tab.id, {
+      type: 'PAGE_FETCH_DETAILED_COURSES',
+      courseSlug,
+      videoSlug,
+      resolution,
+    });
+    return resp;
+  } catch (e) {
+    return { ok: false, error: `content-script unreachable: ${String(e && e.message || e)}` };
+  }
+}
+
 async function readLinkedInCookies() {
   // chrome.cookies.getAll with domain = '.linkedin.com' returns every cookie
   // visible to the extension. We only need li_at + JSESSIONID; everything else
@@ -67,6 +90,17 @@ async function captureActiveVideo() {
     return { ok: false, error: 'no li_at cookie — log into linkedin.com in this browser first' };
   }
   const title = tab.title || '';
+  // Fetch the API response from inside the active tab so the page's own
+  // cookies/network/TLS fingerprint are used. Forward the resulting JSON to
+  // the local server so it only has to download + remux the MP4.
+  const upstream = await fetchDetailedCoursesFromActiveTab({
+    courseSlug: parsed.courseSlug,
+    videoSlug: parsed.videoSlug,
+    resolution: '_1080',
+  });
+  if (!upstream || !upstream.ok) {
+    return { ok: false, error: upstream && upstream.error ? upstream.error : 'page-side fetch failed' };
+  }
   const resp = await fetch(`${SERVER}/api/learning/capture`, {
     method: 'POST',
     headers: {
@@ -80,6 +114,8 @@ async function captureActiveVideo() {
       courseTitle: parsed.courseSlug,
       videoTitle: title.replace(/\s*\|\s*LinkedIn Learning.*$/i, '').trim() || parsed.videoSlug,
       chapterTitle: 'Course',
+      upstreamJson: upstream.json,
+      upstreamStatus: upstream.status,
     }),
   });
   const json = await resp.json().catch(() => ({}));
