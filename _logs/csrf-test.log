@@ -1,0 +1,4 @@
+2026-08-28T11:09:51.122Z WARN capture api non-200 | {"jobId":"job-test-csrf","resolution":"_1080","status":403,"bodySnippet":"CSRF check failed."}
+2026-08-28T11:09:51.124Z WARN capture api non-200 | {"jobId":"job-test-csrf","resolution":"_720","status":403,"bodySnippet":"CSRF check failed."}
+2026-08-28T11:09:51.129Z WARN capture api non-200 | {"jobId":"job-test-csrf","resolution":"_540","status":403,"bodySnippet":"CSRF check failed."}
+2026-08-28T11:09:51.129Z ERROR capture all resolutions failed | {"jobId":"job-test-csrf","error":"csrf check failed — JSESSIONID expired, re-open linkedin.com/learning in the browser to mint a fresh session"}

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LinkedInRec</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>LinkedInRec</h1>
+    <div class="status-line">
+      <span id="server-badge" class="badge">…</span>
+      <span id="last-refresh" class="muted"></span>
+    </div>
+  </header>
+
+  <nav>
+    <button data-tab="linkedin" class="active">LinkedIn Learning</button>
+    <button data-tab="jobs">Jobs</button>
+    <button data-tab="downloads">Downloads</button>
+  </nav>
+
+  <main>
+    <section id="tab-linkedin" class="tab active">
+      <h2>Capture</h2>
+      <p class="muted">
+        Open a LinkedIn Learning course or video in your browser with the
+        extension loaded, then come back here to monitor jobs. The extension's
+        popup can also fire captures directly.
+      </p>
+
+      <div class="card">
+        <h3>Quick test</h3>
+        <p class="muted">Resolve a course's video list without downloading.</p>
+        <div class="form-row">
+          <label for="course-slug">Course slug</label>
+          <input id="course-slug" type="text" placeholder="e.g. become-a-data-scientist" />
+        </div>
+        <button id="btn-enumerate">List videos</button>
+        <pre id="enumerate-result" class="output"></pre>
+      </div>
+    </section>
+
+    <section id="tab-jobs" class="tab">
+      <h2>Jobs</h2>
+      <table id="jobs-table">
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Course / Video</th>
+            <th>Resolution</th>
+            <th>File</th>
+            <th>Error</th>
+            <th>Started</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="jobs-empty" class="muted">No jobs yet.</p>
+    </section>
+
+    <section id="tab-downloads" class="tab">
+      <h2>Downloads</h2>
+      <p class="muted">MP4s under <code>downloads/</code>, newest first.</p>
+      <table id="downloads-table">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Size</th>
+            <th>Modified</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="downloads-empty" class="muted">No downloads yet.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LinkedInRec</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <strong>LinkedInRec</strong>
+    <span id="status" class="badge">…</span>
+  </header>
+
+  <section id="auth">
+    <div class="row">
+      <span class="label">li_at</span>
+      <span id="li_at" class="value">missing</span>
+    </div>
+    <div class="row">
+      <span class="label">JSESSIONID</span>
+      <span id="jsessionid" class="value">missing</span>
+    </div>
+    <div class="row">
+      <span class="label">Server</span>
+      <span id="server" class="value">…</span>
+    </div>
+    <div class="row">
+      <span class="label">Active page</span>
+      <span id="page" class="value">…</span>
+    </div>
+  </section>
+
+  <section id="actions">
+    <button id="capture-video" disabled>Capture this video</button>
+    <button id="capture-course" disabled>Capture entire course</button>
+  </section>
+
+  <section id="result">
+    <pre id="result-text">idle</pre>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>
