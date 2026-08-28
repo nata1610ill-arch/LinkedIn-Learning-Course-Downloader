@@ -106,6 +106,17 @@ async function captureActiveVideo() {
       upstreamStatus: upstream && upstream.status,
     };
   }
+  if (upstream && upstream.bodySnippet) {
+    // Surface what the page-side fetch actually saw so we can tell from the
+    // popup whether LinkedIn returned 200/403/etc and what the body was.
+    return {
+      ok: true,
+      upstreamStatus: upstream.status,
+      upstreamJson: upstream.json,
+      upstreamBodySnippet: upstream.bodySnippet,
+      error: undefined,
+    };
+  }
   const resp = await fetch(`${SERVER}/api/learning/capture`, {
     method: 'POST',
     headers: {
