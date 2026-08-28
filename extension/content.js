@@ -33,12 +33,25 @@
         }
         const url = `/learning-api/detailedCourses?addParagraphsToTranscript=false&q=slugs&resolution=${encodeURIComponent(resolution || '_720')}&courseSlug=${encodeURIComponent(courseSlug)}&videoSlug=${encodeURIComponent(videoSlug)}`;
         // Same-origin relative URL — picks up linkedin.com cookies automatically.
+        // We send the modern browser fetch-metadata headers LinkedIn's edge
+        // expects for XHRs from a real Chrome tab.
         const r = await fetch(url, {
           credentials: 'include',
           headers: {
             accept: 'application/vnd.linkedin.normalized+json+2.1',
             'x-restli-protocol-version': '2.0.0',
             'x-li-lang': 'en_US',
+            'csrf-token': (() => {
+              const m = document.cookie.match(/(?:^|;\s*)JSESSIONID="?([^";]+)/);
+              return m ? m[1] : '';
+            })(),
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-dest': 'empty',
+            'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            referer: location.href,
           },
         });
         const text = await r.text();
