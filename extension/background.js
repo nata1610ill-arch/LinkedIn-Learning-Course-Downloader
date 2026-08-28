@@ -99,7 +99,12 @@ async function captureActiveVideo() {
     resolution: '_1080',
   });
   if (!upstream || !upstream.ok) {
-    return { ok: false, error: upstream && upstream.error ? upstream.error : 'page-side fetch failed' };
+    return {
+      ok: false,
+      upstreamError: upstream && upstream.error ? upstream.error : 'page-side fetch failed',
+      error: upstream && upstream.error ? upstream.error : 'page-side fetch failed',
+      upstreamStatus: upstream && upstream.status,
+    };
   }
   const resp = await fetch(`${SERVER}/api/learning/capture`, {
     method: 'POST',
