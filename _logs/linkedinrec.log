@@ -9255,3 +9255,7 @@
 2026-08-28T12:00:21.372Z WARN capture api non-200 | jobId="job-75-1787918420224" resolution="_540" status=403 bodySnippet="CSRF check failed."
 2026-08-28T12:00:21.372Z ERROR capture all resolutions failed | jobId="job-75-1787918420224" error="csrf check failed — JSESSIONID expired, re-open linkedin.com/learning in the browser to mint a fresh session"
 2026-08-28T12:01:25.761Z ERROR http route error | route="POST /api/debug/probe" error="fetch failed"
+2026-08-28T12:12:29.660Z INFO capture start | jobId="job-76-1787919149660" courseSlug="advanced-facebook-advertising-2021" videoSlug="how-the-facebook-ad-auctions-work"
+2026-08-28T12:12:29.661Z INFO capture using upstream json from content script | jobId="job-76-1787919149660" upstreamStatus=200
+2026-08-28T12:12:30.443Z INFO capture subtitle written | jobId="job-76-1787919149660" srtPath="C:\\Users\\IPP\\Documents\\Projects\\LinkedInRec\\downloads\\advanced-facebook-advertising-2021\\Course\\00-How-the-Facebook-ad-auctions-work.srt" lines=159
+2026-08-28T12:12:30.443Z INFO capture done | jobId="job-76-1787919149660" dest="C:\\Users\\IPP\\Documents\\Projects\\LinkedInRec\\downloads\\advanced-facebook-advertising-2021\\Course\\00-How-the-Facebook-ad-auctions-work.mp4" resolution="640p"

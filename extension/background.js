@@ -147,19 +147,129 @@ async function captureEntireCourse() {
   if (!cookies.li_at) {
     return { ok: false, error: 'no li_at cookie — log into linkedin.com in this browser first' };
   }
-  const resp = await fetch(`${SERVER}/api/learning/capture-all`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-linkedinrec-client': 'extension',
-    },
-    body: JSON.stringify({
-      courseSlug: parsed.courseSlug,
-      cookies,
-    }),
+  // Ask the local server for the curriculum (it scrapes LinkedIn's HTML
+  // for the ld+json chapter list — that doesn't need /learning-api/).
+  const enumResp = await fetch(`${SERVER}/api/learning/course/${encodeURIComponent(parsed.courseSlug)}`);
+  if (!enumResp.ok) {
+    return { ok: false, error: `enumerate failed (${enumResp.status})` };
+  }
+  const course = await enumResp.json().catch(() => ({}));
+  if (!Array.isArray(course.videos) || !course.videos.length) {
+    return { ok: false, error: 'no videos in curriculum' };
+  }
+  const results = [];
+  for (let i = 0; i < course.videos.length; i++) {
+    const v = course.videos[i];
+    const videoUrl = `https://www.linkedin.com/learning/${parsed.courseSlug}/${v.slug}`;
+    let openedTabId = null;
+    let upstream = null;
+    try {
+      // Open the video in a background tab so the content script registers.
+      // We use the chrome.tabs API to avoid stealing the user's active tab.
+      const created = await chrome.tabs.create({ url: videoUrl, active: false });
+      openedTabId = created.id;
+      // Wait until the tab is fully loaded — the content script only
+      // registers on document_idle.
+      await waitForTabComplete(openedTabId);
+      // Give the content script a beat to attach its message listener.
+      await sleep(800);
+      upstream = await fetchDetailedCoursesFromTab(openedTabId, {
+        courseSlug: parsed.courseSlug,
+        videoSlug: v.slug,
+        resolution: '_1080',
+      });
+    } catch (e) {
+      upstream = { ok: false, error: `tab workflow failed: ${String(e && e.message || e)}` };
+    } finally {
+      if (openedTabId != null) {
+        try { await chrome.tabs.remove(openedTabId); } catch {}
+      }
+    }
+    if (!upstream || !upstream.ok) {
+      results.push({ slug: v.slug, title: v.title, status: 'failed', error: (upstream && upstream.error) || 'no upstream' });
+      if (upstream && /40[13]/.test(String(upstream.status || ''))) {
+        // auth-shaped failure mid-batch: abort.
+        break;
+      }
+      continue;
+    }
+    // Forward to the server with upstreamJson so the server skips its own
+    // LinkedIn fetch (which would hit the same li_at TLS-abort issue).
+    const captureResp = await fetch(`${SERVER}/api/learning/capture`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-linkedinrec-client': 'extension',
+      },
+      body: JSON.stringify({
+        courseSlug: parsed.courseSlug,
+        videoSlug: v.slug,
+        cookies,
+        courseTitle: course.courseTitle || parsed.courseSlug,
+        chapterTitle: v.chapterTitle || 'Course',
+        videoTitle: v.title || v.slug,
+        index: i + 1,
+        total: course.videos.length,
+        upstreamJson: upstream.json,
+        upstreamStatus: upstream.status,
+        upstreamBodySnippet: upstream.bodySnippet,
+      }),
+    });
+    const captureJson = await captureResp.json().catch(() => ({}));
+    const job = captureJson.job || {};
+    results.push({
+      slug: v.slug,
+      title: v.title,
+      status: job.status,
+      file: job.file,
+      error: job.error,
+    });
+    if (job.status === 'failed' && job.error && /401|403/.test(job.error)) {
+      break;
+    }
+  }
+  return { ok: true, course: course.courseTitle, results };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function waitForTabComplete(tabId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const check = () => {
+      chrome.tabs.get(tabId, (t) => {
+        if (chrome.runtime.lastError || !t) {
+          reject(new Error(chrome.runtime.lastError ? chrome.runtime.lastError.message : 'tab gone'));
+          return;
+        }
+        if (t.status === 'complete') {
+          resolve(t);
+          return;
+        }
+        if (Date.now() - startedAt > timeoutMs) {
+          reject(new Error('tab load timeout'));
+          return;
+        }
+        sleep(250).then(check);
+      });
+    };
+    check();
   });
-  const json = await resp.json().catch(() => ({}));
-  return { ok: !!json.ok, course: json.course, results: json.results, error: json.error };
+}
+
+async function fetchDetailedCoursesFromTab(tabId, { courseSlug, videoSlug, resolution }) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, {
+      type: 'PAGE_FETCH_DETAILED_COURSES',
+      courseSlug,
+      videoSlug,
+      resolution,
+    });
+  } catch (e) {
+    return { ok: false, error: `content-script unreachable: ${String(e && e.message || e)}` };
+  }
 }
 
 async function listCourses() {
