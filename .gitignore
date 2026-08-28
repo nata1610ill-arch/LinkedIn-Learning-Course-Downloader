@@ -1,0 +1,15 @@
+# Local download artefacts. Files already in history stay there; this
+# keeps new captures out of the repo.
+downloads/
+
+# Server logs. Logs are useful locally but not in version control.
+_logs/
+
+# Node
+node_modules/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
