@@ -8710,3 +8710,4 @@
 2026-08-28T11:31:50.224Z WARN capture api non-200 | jobId="job-25-1787916709601" resolution="_720" status=403 bodySnippet="CSRF check failed."
 2026-08-28T11:31:50.414Z WARN capture api non-200 | jobId="job-25-1787916709601" resolution="_540" status=403 bodySnippet="CSRF check failed."
 2026-08-28T11:31:50.414Z ERROR capture all resolutions failed | jobId="job-25-1787916709601" error="csrf check failed — JSESSIONID expired, re-open linkedin.com/learning in the browser to mint a fresh session"
+2026-08-28T11:34:16.748Z INFO server listening | url="http://localhost:5177"

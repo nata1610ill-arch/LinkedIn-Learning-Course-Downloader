@@ -158,15 +158,6 @@ async function fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution
     'csrf-token': cookies.JSESSIONID || '',
     'x-restli-protocol-version': '2.0.0',
     'x-li-lang': 'en_US',
-    // Modern browser headers LinkedIn's edge started enforcing against CSRF
-    // in 2024-25: missing these and the request 403s even with a valid
-    // JSESSIONID. Values match a recent Windows Chrome session.
-    'sec-fetch-site': 'same-origin',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-dest': 'empty',
-    'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
     referer: `${REFERER_BASE}/${courseSlug}/${videoSlug}`,
     'user-agent': USER_AGENT,
   };
