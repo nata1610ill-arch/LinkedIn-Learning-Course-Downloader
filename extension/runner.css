@@ -1,0 +1,104 @@
+/* LinkedInRec course-walk runner page. Shares the popup's visual language but
+   sized for a full tab instead of a 320px popup. */
+
+body {
+  font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 20px;
+  color: #1a1a1a;
+  background: #fafafa;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #ddd;
+  color: #444;
+}
+.badge.ok    { background: #d6f5d6; color: #156315; }
+.badge.warn  { background: #ffe7c2; color: #7a4a00; }
+.badge.error { background: #ffd6d6; color: #8a1818; }
+
+section { margin-bottom: 14px; }
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid #eee;
+}
+.row:last-child { border-bottom: 0; }
+
+.label { color: #666; font-size: 12px; }
+.value {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: #222;
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#actions { display: flex; gap: 8px; }
+
+button {
+  padding: 8px 12px;
+  border: 1px solid #888;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font: inherit;
+}
+button.secondary { border-color: #bbb; color: #555; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:hover:not(:disabled) { background: #f0f7ff; }
+
+.hint {
+  font-size: 12px;
+  color: #666;
+  background: #fff6e0;
+  border: 1px solid #f0dca8;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 0 0 14px;
+}
+
+label.resolution {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #eee;
+}
+label.resolution select {
+  font: inherit;
+  padding: 4px 6px;
+  border: 1px solid #888;
+  border-radius: 4px;
+  background: #fff;
+}
+
+#items {
+  margin: 0;
+  padding-left: 28px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+}
+#items li { padding: 2px 0; }
+#items li.done    { color: #156315; }
+#items li.failed  { color: #8a1818; }
+#items li.running { color: #7a4a00; font-weight: 600; }
+#items li.skipped { color: #777; }
+#items li .err { color: #8a1818; }

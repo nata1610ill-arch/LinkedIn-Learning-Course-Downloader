@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "LinkedInRec",
-  "version": "1.0.4",
+  "version": "1.0.10",
   "description": "Detects LinkedIn Learning pages and sends course/video slugs + auth cookies to the local LinkedInRec app.",
   "permissions": [
     "activeTab",
     "cookies",
     "scripting",
+    "storage",
     "tabs"
   ],
   "host_permissions": [

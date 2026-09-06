@@ -24,6 +24,17 @@ const LOGS_DIR = path.join(__dirname, '_logs');
 const LOG_FILE = path.join(LOGS_DIR, 'linkedinrec.log');
 const PORT = Number(process.env.PORT) || 5177;
 
+// LinkedIn Learning's detailedCourses endpoint takes a `resolution` hint
+// (`_1080` / `_720` / `_540`). The hint is NOT a cap — the response's
+// `formats[]` array contains every progressive MP4 the course author uploaded,
+// and lib/linkedin-parser.js picks the highest by height, then by bitrate.
+// The hint only affects which rendition is put in `selectedVideo.url.progressiveUrl`
+// when the API has to choose one. So always ask for `_1080` here; the parser
+// degrades gracefully to 720 or 540 if that's all the course has.
+const DEFAULT_RESOLUTION = '_1080';
+// Ladder used only when the upstream JSON is missing/unparseable (legacy
+// CSRF/abuse failures before the browser-side fetch existed). Three rungs is
+// enough — most failures short-circuit on the first.
 const RESOLUTION_LADDER = ['_1080', '_720', '_540'];
 const API_BASE = 'https://www.linkedin.com/learning-api/detailedCourses';
 const USER_AGENT =
@@ -189,8 +200,15 @@ async function fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution
 // — it uses Voyager-style URN strings in `$type` (or no type field at all).
 // Earlier shapes used `elements: [...]`; older public downloaders still hit
 // that path sometimes. We try both.
-async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus }) {
+async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus, route, resolutionOverride }) {
   const jobId = `job-${++jobSeq}-${Date.now()}`;
+  const captureRoute = route || 'active-video';
+  // resolutionOverride pins the API hint ceiling. Ladder shape is computed
+  // once per job so the override applies to the first rung too — if you
+  // override to _720, the ladder starts at _720.
+  const ladder = resolutionOverride
+    ? RESOLUTION_LADDER.slice(RESOLUTION_LADDER.indexOf(resolutionOverride))
+    : RESOLUTION_LADDER;
   const job = {
     id: jobId,
     courseSlug,
@@ -199,6 +217,7 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
     chapterTitle: chapterTitle || 'uncategorized',
     index: index || 0,
     total: total || 1,
+    route: captureRoute,
     status: 'pending',
     resolution: null,
     error: null,
@@ -207,7 +226,7 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
     finishedAt: null,
   };
   jobs.set(jobId, job);
-  log('INFO', 'capture', 'start', { jobId, courseSlug, videoSlug });
+  log('INFO', 'capture', 'start', { jobId, route: captureRoute, courseSlug, videoSlug, index: index || 0, total: total || 1 });
 
   try {
     job.status = 'resolving';
@@ -239,13 +258,41 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
         job.width = parsed.selectedFormat && parsed.selectedFormat.width;
         job.height = parsed.selectedFormat && parsed.selectedFormat.height;
         job.bitrate = parsed.selectedFormat && parsed.selectedFormat.bitrate;
+        // Surface which rendition the parser chose so the user can see in the
+        // log whether the API returned 1080, 720, 540, or something else.
+        const pickedHeight = parsed.selectedFormat && parsed.selectedFormat.height;
+        const allHeights = Array.isArray(parsed.formats)
+          ? parsed.formats
+              .filter((f) => f && (f.type === 'progressive' || f.mimeType === 'video/mp4') && f.url)
+              .map((f) => Number(f.height || 0))
+              .filter((h) => h > 0)
+              .sort((a, b) => b - a)
+          : [];
+        log('INFO', 'capture', 'format picked', {
+          jobId,
+          requestedResolution: '_1080',
+          pickedHeight,
+          pickedBitrate: parsed.selectedFormat && parsed.selectedFormat.bitrate,
+          availableHeights: allHeights,
+        });
       } else {
         lastError = 'no metadata (upstream)';
-        log('WARN', 'capture', 'upstream json had no metadata', { jobId });
+        // Diagnostic: when the upstream fetch succeeds but the parser can't
+        // find a video node, the page-side fetch hit a half-hydrated state.
+        // Log the actual top-level shape so we can fix it instead of guessing.
+        const topKeys = upstreamJson && typeof upstreamJson === 'object'
+          ? Object.keys(upstreamJson) : null;
+        const elemLen = upstreamJson && Array.isArray(upstreamJson.elements)
+          ? upstreamJson.elements.length : null;
+        const incLen = upstreamJson && Array.isArray(upstreamJson.included)
+          ? upstreamJson.included.length : null;
+        log('WARN', 'capture', 'upstream json had no metadata', {
+          jobId, topKeys, elemLen, includedLen: incLen,
+        });
       }
     }
     if (!meta) {
-      for (const res of RESOLUTION_LADDER) {
+      for (const res of ladder) {
       try {
         const result = await fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution: res });
         if (result.status !== 200) {
@@ -330,6 +377,23 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
         job.width = parsed.selectedFormat && parsed.selectedFormat.width;
         job.height = parsed.selectedFormat && parsed.selectedFormat.height;
         job.bitrate = parsed.selectedFormat && parsed.selectedFormat.bitrate;
+        // Same per-job visibility as the browser-side path so the log makes it
+        // obvious which rendition was actually picked versus what the API was
+        // asked for.
+        const ladderHeights = Array.isArray(parsed.formats)
+          ? parsed.formats
+              .filter((f) => f && (f.type === 'progressive' || f.mimeType === 'video/mp4') && f.url)
+              .map((f) => Number(f.height || 0))
+              .filter((h) => h > 0)
+              .sort((a, b) => b - a)
+          : [];
+        log('INFO', 'capture', 'format picked', {
+          jobId,
+          requestedResolution: res,
+          pickedHeight: parsed.selectedFormat && parsed.selectedFormat.height,
+          pickedBitrate: parsed.selectedFormat && parsed.selectedFormat.bitrate,
+          availableHeights: ladderHeights,
+        });
         break;
       } catch (e) {
         lastError = String(e && e.message || e);
@@ -616,12 +680,20 @@ const server = createServer(async (req, res) => {
         return;
       }
       const body = JSON.parse((await readBody(req)) || '{}');
-      const { courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus } = body;
+      const { courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus, route: captureRoute } = body;
       if (!courseSlug || !videoSlug || !cookies || !cookies.li_at) {
         send(res, 400, { ok: false, error: 'courseSlug, videoSlug and cookies.li_at required' });
         return;
       }
-      const job = await captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus });
+      // ?resolution=_1080|_720|_540 on the request URL pins the ceiling the
+      // API is asked for. The parser still picks the best available
+      // progressive MP4 from formats[], so a course that maxes at 720 still
+      // yields 720. Default is the highest LinkedIn serves.
+      const resolutionOverride = (() => {
+        const requested = url.searchParams.get('resolution');
+        return RESOLUTION_LADDER.includes(requested) ? requested : null;
+      })();
+      const job = await captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapterTitle, videoTitle, index, total, upstreamJson, upstreamStatus, route: captureRoute, resolutionOverride });
       send(res, 200, { ok: job.status === 'done' || job.status === 'already_done', job });
       return;
     }
@@ -649,6 +721,7 @@ const server = createServer(async (req, res) => {
           videoTitle: v.title,
           index: v.videoIndex + 1,
           total: course.videos.length,
+          route: 'capture-all-server',
         });
         results.push({ slug: v.slug, title: v.title, status: job.status, file: job.file, error: job.error });
         if (job.status === 'failed' && job.error && /401|403/.test(job.error)) {
@@ -657,6 +730,28 @@ const server = createServer(async (req, res) => {
         }
       }
       send(res, 200, { ok: true, course: course.courseTitle, results });
+      return;
+    }
+    if (route === 'POST /api/learning/runner-log') {
+      if (!isTrustedMutationRequest(req)) {
+        send(res, 403, { ok: false, error: 'trusted extension request required' });
+        return;
+      }
+      const body = JSON.parse((await readBody(req)) || '{}');
+      const { courseSlug, videoSlug, index, total, outcome, error: runnerError, upstreamStatus } = body;
+      if (!courseSlug || !videoSlug) {
+        send(res, 400, { ok: false, error: 'courseSlug and videoSlug required' });
+        return;
+      }
+      // Surface the runner's per-video outcome in the same log the server
+      // captures write to. Without this, page-fetch failures during the walk
+      // leave no log trace at all.
+      log('WARN', 'runner', `video ${outcome}`, {
+        courseSlug, videoSlug, index, total,
+        error: runnerError ? String(runnerError).slice(0, 240) : null,
+        upstreamStatus: upstreamStatus != null ? Number(upstreamStatus) : null,
+      });
+      send(res, 200, { ok: true });
       return;
     }
     if (url.pathname.startsWith('/api/learning/course/')) {

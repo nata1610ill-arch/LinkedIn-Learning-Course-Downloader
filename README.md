@@ -7,7 +7,7 @@ machine. No cloud, no upload.
 ## What it does
 
 - A local Node.js server on `http://localhost:5177`.
-- A Chrome/Edge/Brave MV3 extension loaded from `extension/`.
+- A Chrome / Edge / Brave MV3 extension loaded from `extension/`.
 - When you open a LinkedIn Learning page, the extension's content script
   fetches `/learning-api/detailedCourses` from the page context (so the
   request rides your browser's own cookie jar, network path, and TLS
@@ -20,11 +20,13 @@ machine. No cloud, no upload.
 - Each download also writes an English `.srt` subtitle file alongside the
   MP4 from the `selectedVideo.transcript.lines[]` block already in the same
   JSON — no separate API call, no language selection needed.
-- Single-video capture (`Capture this video`) runs the fetch from the
+- **Single-video capture** (`Capture this video`) runs the fetch from the
   user's active tab.
-- Whole-course capture (`Capture entire course`) opens each video URL in
-  a hidden background tab, page-fetches it, captures it, closes the tab,
-  and moves to the next.
+- **Whole-course capture** (`Capture entire course`) opens a dedicated
+  runner tab (`extension/runner.html`) that walks the curriculum end to
+  end with one persistent LinkedIn tab, retrying rate-limited videos
+  in-place instead of skipping them. Progress checkpoints to
+  `chrome.storage.local` after every video.
 
 This is the same mechanism public tools (yt-dlp, llvd,
 J3Patel/linkedin-learning-video-downloader) have used since 2019. It only
@@ -46,6 +48,28 @@ the JSON is handed to the local server. The server only downloads the
 signed MP4 (which uses a different auth path that works from any
 egress) and writes the file.
 
+## Why the walk lives in a runner tab (and uses one persistent tab)
+
+Two MV3 / LinkedIn realities shaped the runner:
+
+1. **5-minute handler cap.** Chrome hard-terminates an MV3 service worker
+   when a single event handler runs longer than 5 minutes. The walk used
+   to live inside `chrome.runtime.onMessage` and was truncated mid-course
+   with no error and no resume. The runner tab (an extension page) has no
+   such cap.
+
+2. **Per-tab rate-limit budget.** LinkedIn's edge rate-limits
+   `/learning-api/` per session/origin. Opening a fresh background tab per
+   video appeared as a new session — even with pacing, bursts of new tabs
+   produced `429 Too Many Requests`. The runner now opens **one
+   persistent tab** for the whole walk and navigates it between videos.
+   Same JS context, same cookies, same rate-limit budget.
+
+The combined effect: a 123-video course completes in one click without
+gaps. Each video takes ~2-3 seconds when throttled only by inter-iteration
+pacing, and a 429-blocked video is retried in place with a 15s / 30s / 60s
+backoff ladder (cap: 4 attempts, ~3 min) before the walk gives up on it.
+
 ## Requirements
 
 - Node.js 20 or newer
@@ -62,8 +86,7 @@ ffmpeg -version
 ffprobe -version
 ```
 
-Install dependencies (none beyond Node, but the step keeps parity with
-FetchTV):
+Install dependencies (none beyond Node, but the step keeps parity):
 
 ```bash
 npm install
@@ -100,9 +123,11 @@ tunnel, or reverse proxy — `li_at` is a high-value session token.
    (`chrome://extensions` → LinkedInRec) tells you which build is loaded.
 
 The extension's required permissions are `activeTab`, `cookies`,
-`scripting`, `tabs`, and `host_permissions: <all_urls>` +
-`http://localhost:5177/*`. Cookies are read only from `linkedin.com` and
-only used to invoke the content script's same-origin page fetch.
+`scripting`, `storage`, `tabs`, and `host_permissions:
+https://*.linkedin.com/*` + `http://localhost:5177/*`. Cookies are read
+only from `linkedin.com` and only used to invoke the content script's
+same-origin page fetch. `storage` holds nothing but the course-walk
+checkpoint (course slug, video list, cursor, resolution) — never cookies.
 
 ## Main workflow
 
@@ -114,11 +139,19 @@ only used to invoke the content script's same-origin page fetch.
 4. The extension's toolbar icon turns green when auth cookies are
    detected.
 5. Click the toolbar icon:
-   - **Capture this video** — grabs the currently playing video (active
-     tab must be a video URL).
-   - **Capture entire course** — walks the curriculum and grabs every
-     video in order (active tab can be the course root).
-6. Watch progress on the **LinkedIn** tab of `http://localhost:5177`.
+   - **Capture this video** — grabs the currently playing video. The
+     active tab must be a video URL.
+   - **Capture entire course** — walks the curriculum end to end. The
+     active tab can be the course root or any video in the course. A
+     runner tab opens and shows live progress.
+6. Watch progress in the runner tab (not the popup — the popup returns
+   immediately when the runner is spawned).
+
+The runner has a **resolution ceiling** dropdown that defaults to
+"highest available" (asks the API for `_1080`, parser picks the highest
+progressive MP4 LinkedIn serves). Pin to 720p or 540p to save bandwidth
+or disk; the choice is baked into the checkpoint so a mid-walk change
+can't produce a half-1080 half-720 batch.
 
 Final files appear under:
 
@@ -144,9 +177,11 @@ downloads/<course-slug>/
 4. Content script calls `fetch('/learning-api/detailedCourses?...')` from
    the page context with `credentials: 'include'`, modern
    `sec-fetch-*` headers, and a `csrf-token` header built from the
-   page's `JSESSIONID` cookie.
-5. Content script returns `{ok, status, json, bodySnippet}` to the
-   background script.
+   page's `JSESSIONID` cookie. If the response is a 200 with an empty
+   payload (`elements: []`, `included: []`) — the SPA hadn't hydrated
+   yet — it retries up to 5 times with a 600ms gap.
+5. Content script returns `{ok, status, json, bodySnippet, attempts}` to
+   the background script.
 6. Background script POSTs `{courseSlug, videoSlug, cookies, …,
    upstreamJson}` to `http://localhost:5177/api/learning/capture`.
 7. Server extracts `selectedVideo.progressiveUrl` from the upstream
@@ -160,19 +195,50 @@ downloads/<course-slug>/
 
 ## How a course walk works
 
-1. Background script GETs `/api/learning/course/<slug>` from the local
-   server, which fetches the course HTML and parses the embedded
-   `application/ld+json` curriculum.
-2. For each video in the curriculum, the background script:
-   - opens `https://www.linkedin.com/learning/<course>/<video>` in a
-     hidden tab via `chrome.tabs.create({active:false})`,
-   - waits for `chrome.tabs.onUpdated` to report `status: 'complete'`,
-   - gives the content script ~800ms to register its message listener,
-   - sends `PAGE_FETCH_DETAILED_COURSES` and reads the upstream JSON,
-   - POSTs `{…, upstreamJson}` to `/api/learning/capture`,
-   - closes the tab.
-3. The local server handles each capture identically to single-video
-   mode.
+1. Popup sends `CAPTURE_COURSE`. The background script resolves the course
+   slug from the active tab and opens
+   `runner.html?course=<slug>` in a new tab, then returns immediately. It
+   does **not** run the walk itself (see "Why the walk lives in a runner
+   tab").
+2. `runner.js` GETs `/api/learning/course/<slug>` from the local server,
+   which fetches the course HTML and parses the embedded
+   `application/ld+json` curriculum. The result (videos list + pinned
+   resolution) is written to `chrome.storage.local` as
+   `{courseSlug, videos, cursor, resolution}`.
+3. The runner opens **one persistent LinkedIn tab** seeded with the first
+   video's URL, then walks the rest:
+   - `chrome.tabs.update({url})` to navigate the persistent tab to the
+     next video URL.
+   - Wait for `status: 'complete'`, then poll
+     `window.__linkedinrecReady` for up to 8s. If it never sets, force
+     `chrome.scripting.executeScript({files:['content.js']})` and wait
+     again — covers the case where the content script didn't auto-inject.
+   - Send `PAGE_FETCH_DETAILED_COURSES` with a 15s `sendMessage` race.
+   - POST `{…, upstreamJson, route: 'capture-all-runner'}` to
+     `/api/learning/capture`. The `route` tag distinguishes walk
+     captures from single-video ones in the log.
+   - Save checkpoint with `cursor = i + 1`. Closing the runner tab loses
+     at most the video in flight.
+4. **Rate-limit handling.** If `captureOne` returns
+   `result.rateLimited === true` (the page-side fetch got HTTP 429), the
+   runner does not advance. It sleeps `[15s, 30s, 60s]` between attempts,
+   capped at 4 attempts (~3 min total), and re-tries the same video.
+   Status line updates live: `429 on video 12 — retrying in 30s (attempt 2)`.
+   If the cap is hit, the video is marked failed and the walk continues
+   — the user can resume manually to retry it.
+5. **Per-video outcome reporting.** Every non-success outcome is posted
+   to `POST /api/learning/runner-log`, which writes
+   `WARN runner video <outcome> | ...` to `_logs/linkedinrec.log`. This
+   is what made the 429 issue visible — without it, the walk's silent
+   skips looked identical to "no videos attempted yet".
+6. On a clean finish the checkpoint is deleted. If any video failed, the
+   checkpoint is kept so reopening the walk retries only what's missing.
+7. The persistent tab is closed in a `finally` block so the tab is
+   released no matter how the walk ends (success, stop, exception,
+   tab-closed-mid-walk).
+
+Re-clicking **Capture entire course** for a slug that already has a runner
+tab open focuses that tab instead of starting a competing walk.
 
 ## What will NOT work
 
@@ -182,6 +248,12 @@ downloads/<course-slug>/
   encrypted. Those videos are reported as `DRM_PROTECTED` in the UI;
   bypassing them requires extracting a CDM from a hardware device, which
   is out of scope.
+- **Some enterprise-licensed courses** (Red Hat, certain training
+  vendors) use the same EME / HLS path on desktop even though they
+  aren't Hollywood content. The progressive MP4 endpoint simply isn't
+  available for those videos, and the player falls back to the encrypted
+  stream. The tool can see the videos in the curriculum (it reads the
+  HTML `ld+json`) but cannot download them.
 - **Content you cannot already view.** The tool does not authenticate
   you. You must be logged in with an active subscription in the browser
   that the extension is loaded into.
@@ -190,6 +262,18 @@ downloads/<course-slug>/
   existing session is simpler and more reliable.
 
 ## Troubleshooting
+
+### Runaway gaps — videos silently skipped during a course walk
+
+Three failure modes have produced this historically. Always check
+`_logs/linkedinrec.log` for the exact signature:
+
+| Log signature | Root cause | Fix |
+|---|---|---|
+| `WARN runner video failed \| error="content-script unreachable"` | Tab opened, content script never attached | Already mitigated — `waitForContentScriptReady` polls `window.__linkedinrecReady` for 8s and force-injects if needed. If still happening: reload extension at `chrome://extensions`, then reload the LinkedIn tab. |
+| `WARN runner video failed \| error="no upstream"` with no `upstreamStatus` | Older 1.0.x versions — invisible skip | Upgrade to ≥ 1.0.7; that field is in the log now. |
+| `WARN runner video failed \| upstreamStatus=429` | LinkedIn's edge throttled the request | Already mitigated by 1.0.9 (persistent tab) and 1.0.10 (retry-in-place with 15s/30s/60s backoff). If a video hits the retry cap and stays failed, the walk continues; click "Capture entire course" again to retry just it. |
+| Walk stops with no log line at all | Old MV3 service-worker 5-minute cap | Fixed in 1.0.5 — walk runs in `runner.html`, not the service worker. |
 
 ### "no resolution found" / jobs in `failed` status
 
@@ -210,6 +294,16 @@ Common values:
 The course is Widevine-protected on desktop. The mobile app offers
 offline downloads for some of these; this tool does not.
 
+### A long course stops partway through with no error in the log
+
+Fixed in 1.0.5 — the walk runs in the runner tab, not the service
+worker. If you still see this, check that the version number at
+`chrome://extensions` matches `extension/manifest.json` (Chrome MV3
+caches the old service worker otherwise — toggle OFF and ON to force a
+clean reload). The walk's last line in the log shows the
+`route="capture-all-runner"` capture index it reached; reopen the walk to
+resume from the checkpoint.
+
 ### Subtitle file is empty or missing
 
 The course's video has no transcript in LinkedIn's response. This is
@@ -227,8 +321,11 @@ rare but happens for some older courses.
 LinkedInRec/
 ├── extension/
 │   ├── manifest.json
-│   ├── background.js       service worker (cookie harvest, tab orchestration)
-│   ├── content.js          page-side /learning-api fetch + subtitle extraction
+│   ├── background.js       service worker (cookie harvest, spawns runner tab)
+│   ├── content.js          page-side /learning-api fetch + retry on empty payload
+│   ├── runner.html         course-walk UI (no service-worker lifetime cap)
+│   ├── runner.css
+│   ├── runner.js           walk loop, persistent tab, 429 retry-in-place
 │   ├── popup.html
 │   ├── popup.css
 │   └── popup.js
@@ -239,6 +336,10 @@ LinkedInRec/
 ├── lib/
 │   ├── linkedin-parser.js  extractVideoMetadata + transcript/SRT helpers
 │   └── media.js            atomicDownload + ffprobe wrappers
+├── test/
+│   ├── *.test.js                Node test suite (run via `npm test`)
+│   ├── runner-walk.harness.mjs  vm-based harness for runner.js (10 scenarios)
+│   └── capture-course.handler.harness.mjs  service-worker CAPTURE_COURSE harness
 ├── downloads/              all MP4 + SRT outputs land here (gitignored)
 ├── _logs/
 │   └── linkedinrec.log     structured log of every capture (gitignored)
@@ -257,7 +358,8 @@ Start server:
 npm start
 ```
 
-Run tests (17 specs covering parser, media pipeline, security):
+Run tests (19 specs across parser, media pipeline, security, plus 10
+runner-harness scenarios + 3 service-worker handler scenarios):
 
 ```bash
 npm test
@@ -273,6 +375,19 @@ Tail the log:
 
 ```bash
 tail -f _logs/linkedinrec.log
+```
+
+Look for skipped videos (per-video outcome reporter added in 1.0.7):
+
+```bash
+grep "runner video failed" _logs/linkedinrec.log
+```
+
+Look for resolution that's actually getting picked (per-video log line
+added in 1.0.6):
+
+```bash
+grep "format picked" _logs/linkedinrec.log
 ```
 
 List completed MP4s newest first (Windows):

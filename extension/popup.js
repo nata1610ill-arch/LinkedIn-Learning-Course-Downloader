@@ -76,9 +76,14 @@ els.captureVideo.addEventListener('click', async () => {
 
 els.captureCourse.addEventListener('click', async () => {
   els.captureCourse.disabled = true;
-  showResult({ status: 'walking course…' });
+  showResult({ status: 'opening course-walk runner…' });
   const resp = await chrome.runtime.sendMessage({ type: 'CAPTURE_COURSE' });
-  showResult(resp);
+  // The walk itself now runs in the runner tab (extension/runner.js) so it is
+  // not bound to the service worker's 5-minute event-handler limit. Progress is
+  // shown in that tab, not here.
+  showResult(resp && resp.ok
+    ? { ...resp, note: 'walk running in the LinkedInRec runner tab — watch progress there' }
+    : resp);
   els.captureCourse.disabled = false;
 });
 

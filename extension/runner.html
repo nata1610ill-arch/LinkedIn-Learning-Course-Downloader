@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LinkedInRec — course walk</title>
+  <link rel="stylesheet" href="runner.css" />
+</head>
+<body>
+  <header>
+    <strong>LinkedInRec</strong>
+    <span id="status" class="badge">starting…</span>
+  </header>
+
+  <section id="meta">
+    <div class="row">
+      <span class="label">Course</span>
+      <span id="course" class="value">…</span>
+    </div>
+    <div class="row">
+      <span class="label">Progress</span>
+      <span id="progress" class="value">…</span>
+    </div>
+    <div class="row">
+      <span class="label">Current</span>
+      <span id="current" class="value">…</span>
+    </div>
+  </section>
+
+  <section id="actions">
+    <label class="resolution">
+      <span class="label">Resolution ceiling</span>
+      <select id="resolution">
+        <option value="_1080">highest available (default)</option>
+        <option value="_720">720p</option>
+        <option value="_540">540p</option>
+      </select>
+    </label>
+    <button id="stop">Stop after current video</button>
+    <button id="reset" class="secondary">Clear saved progress</button>
+  </section>
+
+  <p class="hint">
+    Keep this tab open until the walk finishes. Progress is checkpointed after
+    every video — closing the tab and reopening the walk resumes where it left
+    off.
+  </p>
+
+  <section id="log">
+    <ol id="items"></ol>
+  </section>
+
+  <script src="runner.js"></script>
+</body>
+</html>

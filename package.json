@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test",
-    "lint": "node --check server.js && node --check lib/linkedin-parser.js && node --check lib/media.js && node --check extension/background.js && node --check extension/content.js && node --check extension/popup.js && node --check public/app.js"
+    "lint": "node --check server.js && node --check lib/linkedin-parser.js && node --check lib/media.js && node --check extension/background.js && node --check extension/content.js && node --check extension/popup.js && node --check extension/runner.js && node --check public/app.js"
   },
   "engines": {
     "node": ">=20"
