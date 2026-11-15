@@ -309,6 +309,47 @@ from DevTools (Network -> `learning-api` -> Request Headers ->
 page. `identity=yes identitySrc=...` in the log line proves which one was
 sent.
 
+### Video quality — downloads are 640p although the player offers 720p or 1080p
+
+**Symptom:** `_logs/linkedinrec.log` shows `format picked` with
+`chosenPath="…/mp4-640p-30fp-crf28/…"` and `offeredFormats` entries that all
+carry `"height":540` and `hasUrl:false`, so every file comes out as
+1138x640.
+
+**Why:** the learning API's `formats[]` array is metadata only — no URLs.
+The only URL with a picture is `urls.progressiveUrl`, and its path pins one
+fixed rendition (`mp4-640p-…`). The adaptive rendition list lives in
+`urls.streamingUrl`, which is an HLS master playlist.
+
+**What the server does now:** it prefers `streamingUrl`. It fetches the
+master playlist, picks the highest video rendition up to the selected
+quality, downloads the audio rendition as well (`#EXT-X-MEDIA:TYPE=AUDIO`),
+concatenates the CMAF fragments itself and muxes both streams with
+`ffmpeg -c copy`. ffmpeg cannot read these playlists directly: LinkedIn's
+segments end in `/2/…?e=…` with no file extension, which trips its
+`allowed_segment_extensions` guard even with `-allowed_extensions ALL`, hence
+the in-app concatenation. The progressive URL stays as the fallback.
+
+| Log line | Meaning |
+|---|---|
+| `hls download done \| variants=3 variantHeight=720 height=720 audio=true` | played the adaptive stream; `height` is measured by `ffprobe` |
+| `upgrading existing file \| from=640p to=720p` | a file on disk was below the offered rendition, so it was replaced |
+| `hls failed, falling back to progressive \| error=…` | playlist or segment problem; the run still finishes at the progressive quality |
+
+`resolution` in the closing `capture done` line is the measured height of
+the finished file.
+
+Knobs (all optional):
+
+- `LINKEDINREC_MAX_HEIGHT=720` — hard cap. Default is the quality selected
+  in the runner (`_1080`), so courses that offer 1080p download as 1080p.
+- `LINKEDINREC_FORCE=1` — re-download every video even if the file exists.
+  Without it, an existing file is only replaced when the course offers a
+  higher rendition than the file's measured height.
+
+The course's own ceiling wins: a 720p master yields 720p no matter which
+quality is selected.
+
 ### "no resolution found" / jobs in `failed` status
 
 Check `_logs/linkedinrec.log`. Each failed job carries an `error` string.

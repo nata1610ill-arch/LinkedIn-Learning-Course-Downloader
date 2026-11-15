@@ -15,7 +15,7 @@ import { mkdir, stat, readdir, appendFile, rm, writeFile } from 'node:fs/promise
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { extractVideoMetadata, extractTranscriptLines, renderSrt, findVideoObject } from './lib/linkedin-parser.js';
-import { atomicDownload, probeMedia } from './lib/media.js';
+import { atomicDownload, bestHlsVariant, downloadHls, probeMedia } from './lib/media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -23,6 +23,12 @@ const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 const LOGS_DIR = path.join(__dirname, '_logs');
 const LOG_FILE = path.join(LOGS_DIR, 'linkedinrec.log');
 const PORT = Number(process.env.PORT) || 5177;
+// `LINKEDINREC_FORCE=1` re-downloads even when a file is already on disk —
+// needed to upgrade existing 640p files once a higher rendition is available.
+const FORCE_REDOWNLOAD = process.env.LINKEDINREC_FORCE === '1';
+// Printed on startup. A stale server is the most common reason a fix "does not
+// work", so the log line now proves which capture pipeline is loaded.
+const PIPELINE = 'hls-segment-concat';
 
 // LinkedIn Learning's detailedCourses endpoint takes a `resolution` hint
 // (`_1080` / `_720` / `_540`). The hint is NOT a cap — the response's
@@ -277,7 +283,30 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
           pickedHeight,
           pickedBitrate: parsed.selectedFormat && parsed.selectedFormat.bitrate,
           availableHeights: allHeights,
+          // What the API actually offered (no signed query string, path only).
+          hasStreaming: !!parsed.streamingUrl,
+          urlKeys: parsed.urlObjectKeys,
+          chosenPath: parsed.progressivePathOnly,
+          offeredFormats: Array.isArray(parsed.formatInventory) ? parsed.formatInventory : [],
         });
+        // Full inventory on disk, opt-in: `LINKEDINREC_DUMP_FORMATS=1 npm start`.
+        // Needed to answer "is there a higher rendition?" without guessing.
+        if (process.env.LINKEDINREC_DUMP_FORMATS === '1') {
+          const formatDump = path.join(LOGS_DIR, `formats-${videoSlug}.json`);
+          try {
+            await writeFile(formatDump, JSON.stringify({
+              videoSlug,
+              requestedResolution: '_1080',
+              chosenPath: parsed.progressivePathOnly,
+              urlObjectKeys: parsed.urlObjectKeys,
+              selectedFormat: parsed.selectedFormat,
+              formatInventory: parsed.formatInventory,
+            }, null, 2), 'utf8');
+            log('INFO', 'capture', 'dumped format inventory', { jobId, formatDump });
+          } catch (e) {
+            log('WARN', 'capture', 'format dump failed', { jobId, error: String(e && e.message || e) });
+          }
+        }
       } else {
         lastError = 'no metadata (upstream)';
         // Diagnostic: when the upstream fetch succeeds but the parser can't
@@ -485,26 +514,6 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
     await mkdir(chapterDir, { recursive: true });
     const dest = path.join(chapterDir, `${prefix}-${safeVideo}.mp4`);
 
-    try {
-      const existingMedia = await probeMedia(dest);
-      if (existingMedia) {
-        const s = await stat(dest);
-        job.status = 'already_done';
-        job.file = dest;
-        job.width = existingMedia.width;
-        job.height = existingMedia.height;
-        job.bitrate = existingMedia.bitrate;
-        job.resolution = existingMedia.height ? `${existingMedia.height}p` : job.resolution;
-        job.finishedAt = ts();
-        log('INFO', 'capture', 'already on disk, skipping', { jobId, dest, size: s.size });
-        return job;
-      }
-      await rm(dest, { force: true });
-    } catch {
-      await rm(dest, { force: true });
-    }
-
-    job.status = 'downloading';
     const headers = {
       'user-agent': USER_AGENT,
       accept: '*/*',
@@ -516,12 +525,84 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
       cleanJsid && `JSESSIONID="${cleanJsid}"`,
     ].filter(Boolean).join('; ');
     if (cookieHeader) headers.cookie = cookieHeader;
+    const maxHeight = Number(process.env.LINKEDINREC_MAX_HEIGHT || 0) ||
+      (resolutionOverride ? Number(String(resolutionOverride).replace('_', '')) : 0) || null;
 
-    const mediaInfo = await atomicDownload({
-      url: meta.progressiveUrl,
-      destination: dest,
-      headers,
-    });
+    try {
+      const existingMedia = await probeMedia(dest);
+      // Auto-upgrade: when the adaptive stream offers a higher rendition than the
+      // file on disk, replace it instead of skipping. Without this, anything
+      // first downloaded at 640p would stay at 640p forever — re-running the walk
+      // could never improve quality.
+      let upgradeTo = null;
+      if (existingMedia && !FORCE_REDOWNLOAD && meta.streamingUrl) {
+        try {
+          const best = await bestHlsVariant({ url: meta.streamingUrl, headers, maxHeight });
+          if (best.picked && best.picked.height && existingMedia.height &&
+              best.picked.height > existingMedia.height) {
+            upgradeTo = best.picked.height;
+          }
+        } catch {
+          /* playlist unavailable — keep the file that is already there */
+        }
+      }
+      if (existingMedia && !FORCE_REDOWNLOAD && !upgradeTo) {
+        const s = await stat(dest);
+        job.status = 'already_done';
+        job.file = dest;
+        job.width = existingMedia.width;
+        job.height = existingMedia.height;
+        job.bitrate = existingMedia.bitrate;
+        job.resolution = existingMedia.height ? `${existingMedia.height}p` : job.resolution;
+        job.finishedAt = ts();
+        log('INFO', 'capture', 'already on disk, skipping', { jobId, dest, size: s.size });
+        return job;
+      }
+      if (upgradeTo) {
+        log('INFO', 'capture', 'upgrading existing file', {
+          jobId, dest, from: `${existingMedia.height}p`, to: `${upgradeTo}p`,
+        });
+      }
+      await rm(dest, { force: true });
+    } catch {
+      await rm(dest, { force: true });
+    }
+
+    job.status = 'downloading';
+
+    // Prefer the adaptive stream. The progressive URL is pinned to a single
+    // rendition (its path reads `.../mp4-640p-30fp-crf28/...`), while the HLS
+    // master playlist carries every rendition the player offers. Fall back to the
+    // progressive URL whenever the playlist is missing, unparsable, or ffmpeg
+    // fails.
+    let mediaInfo = null;
+    if (meta.streamingUrl) {
+      try {
+        mediaInfo = await downloadHls({ url: meta.streamingUrl, destination: dest, headers, maxHeight });
+        log('INFO', 'capture', 'hls download done', {
+          jobId,
+          variants: mediaInfo.variants,
+          variantHeight: mediaInfo.variantHeight,
+          height: mediaInfo.height,
+          bitrate: mediaInfo.bitrate,
+          audio: mediaInfo.audio,
+        });
+      } catch (e) {
+        log('WARN', 'capture', 'hls failed, falling back to progressive', {
+          jobId,
+          error: String(e && e.message || e),
+        });
+        await rm(dest, { force: true });
+        mediaInfo = null;
+      }
+    }
+    if (!mediaInfo) {
+      mediaInfo = await atomicDownload({
+        url: meta.progressiveUrl,
+        destination: dest,
+        headers,
+      });
+    }
 
     job.status = 'done';
     job.file = dest;
@@ -858,5 +939,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  log('INFO', 'server', 'listening', { url: `http://localhost:${PORT}` });
+  log('INFO', 'server', 'listening', { url: `http://localhost:${PORT}`, pipeline: PIPELINE, node: process.version });
 });
