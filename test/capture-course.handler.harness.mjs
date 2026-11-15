@@ -40,6 +40,14 @@ function makeSandbox({ activeTabs = [], allTabs = [], lastError = null } = {}) {
       cookies: {
         async getAll() { return [{ name: 'li_at', value: 'DUMMY_LI_AT' }, { name: 'JSESSIONID', value: 'ajax:1234' }]; },
       },
+      // captureEntireCourse reads the optional corporate x-li-identity header.
+      storage: {
+        local: {
+          async get() { return {}; },
+          async set() {},
+          async remove() {},
+        },
+      },
       tabs: {
         async query({ active, currentWindow, url } = {}) {
           calls.push(['query', { active, currentWindow, url }]);

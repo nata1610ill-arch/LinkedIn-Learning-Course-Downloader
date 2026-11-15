@@ -40,6 +40,12 @@ const els = {
   resolution: document.getElementById('resolution'),
 };
 
+// Must match `BUILD` in content.js. Chrome serves the content script from the
+// snapshot taken at the last extension reload, so after editing content.js an
+// unchanged runner would talk to an old script and fail on every video with a
+// confusing error. Detect that and say what to do instead.
+const EXPECTED_CONTENT_BUILD = '1.0.17';
+
 const ALLOWED_RESOLUTIONS = ['_1080', '_720', '_540'];
 let stopRequested = false;
 let activeResolution = '_1080';
@@ -102,7 +108,7 @@ function waitForTabComplete(tabId, timeoutMs = 30000) {
   });
 }
 
-async function fetchDetailedCoursesFromTab(tabId, { courseSlug, videoSlug, resolution }) {
+async function fetchDetailedCoursesFromTab(tabId, { courseSlug, videoSlug, resolution, csrfToken, videoUrl, account, enterpriseIdentity }) {
   try {
     const resp = await Promise.race([
       chrome.tabs.sendMessage(tabId, {
@@ -110,6 +116,10 @@ async function fetchDetailedCoursesFromTab(tabId, { courseSlug, videoSlug, resol
         courseSlug,
         videoSlug,
         resolution,
+        csrfToken,
+        videoUrl,
+        account,
+        enterpriseIdentity,
       }),
       new Promise((_, reject) => setTimeout(
         () => reject(new Error(`page-fetch timeout after ${PAGE_FETCH_TIMEOUT_MS}ms`)),
@@ -175,7 +185,7 @@ function renderList(state) {
     const r = state.results[i];
     const li = document.createElement('li');
     const status = r ? r.status : (i === state.cursor ? 'running' : 'pending');
-    li.className = status;
+    li.className = status === 'drm_protected' ? 'warn' : status;
     li.textContent = v.title || v.slug;
     if (r && r.error) {
       const err = document.createElement('span');
@@ -189,8 +199,10 @@ function renderList(state) {
 
 function renderProgress(state) {
   const done = state.results.filter((r) => r && (r.status === 'done' || r.status === 'already_done')).length;
-  const failed = state.results.filter((r) => r && r.status === 'failed').length;
-  els.progress.textContent = `${done} done, ${failed} failed, ${state.videos.length} total`;
+  const failed = state.results.filter((r) => r && (r.status === 'failed' || r.status === 'drm_protected')).length;
+  const drm = state.results.filter((r) => r && r.status === 'drm_protected').length;
+  const drmNote = drm ? ` (${drm} subscription-required/DRM)` : '';
+  els.progress.textContent = `${done} done, ${failed} failed${drmNote}, ${state.videos.length} total`;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,12 +217,12 @@ async function readLinkedInCookies() {
 // Surface a per-video outcome to the server log so silent skips become
 // visible. Without this, a video that fails the page-fetch path looks
 // identical to one that was never attempted.
-async function reportRunnerOutcome(courseSlug, videoSlug, index, total, outcome, error, upstreamStatus) {
+async function reportRunnerOutcome(courseSlug, videoSlug, index, total, outcome, error, upstreamStatus, detail) {
   try {
     await fetch(`${SERVER}/api/learning/runner-log`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-linkedinrec-client': 'extension' },
-      body: JSON.stringify({ courseSlug, videoSlug, index, total, outcome, error, upstreamStatus }),
+      body: JSON.stringify({ courseSlug, videoSlug, index, total, outcome, error, upstreamStatus, detail }),
     });
   } catch { /* logging is best-effort — never let it break the walk */ }
 }
@@ -225,9 +237,31 @@ async function enumerateCourse(courseSlug) {
   return course;
 }
 
+function detectEnterpriseAccount(json) {
+  if (!json || typeof json !== 'object') return null;
+  if (Array.isArray(json.included)) {
+    for (const item of json.included) {
+      if (!item || typeof item !== 'object') continue;
+      const details = item.details;
+      const urn = (details && details.enterpriseProfileUrn) || item.enterpriseProfileUrn;
+      if (urn && typeof urn === 'string') {
+        const m = urn.match(/enterpriseAccount:(\d+)/);
+        if (m) return m[1];
+      }
+    }
+  }
+  return null;
+}
+
 async function captureOne(state, i, cookies, persistentTabId) {
+  const latestCookies = (await readLinkedInCookies()) || cookies;
+  cookies = latestCookies;
   const v = state.videos[i];
-  const videoUrl = `https://www.linkedin.com/learning/${state.courseSlug}/${v.slug}`;
+  const accountParam = state.account ? `?u=${encodeURIComponent(state.account)}` : '';
+  let videoUrl = v.contentUrl || `https://www.linkedin.com/learning/${state.courseSlug}/${v.slug}`;
+  if (state.account && !videoUrl.includes('?')) {
+    videoUrl += accountParam;
+  }
   let openedTabId = null;
   let openedTabOwnsLifecycle = false;
   let upstream = null;
@@ -239,7 +273,13 @@ async function captureOne(state, i, cookies, persistentTabId) {
       // 429s mid-walk even with pacing. Navigating the same tab keeps the
       // cookie jar, the React context, and the limiter budget intact.
       openedTabId = persistentTabId;
-      await chrome.tabs.update(openedTabId, { url: videoUrl, active: false });
+      try {
+        await chrome.tabs.update(openedTabId, { url: videoUrl, active: false });
+      } catch (e) {
+        // Persistent tab was closed mid-walk — recover by opening a fresh tab
+        const created = await chrome.tabs.create({ url: videoUrl, active: false });
+        openedTabId = created.id;
+      }
       await waitForTabComplete(openedTabId);
     } else {
       const created = await chrome.tabs.create({ url: videoUrl, active: false });
@@ -255,7 +295,43 @@ async function captureOne(state, i, cookies, persistentTabId) {
       courseSlug: state.courseSlug,
       videoSlug: v.slug,
       resolution: '_1080',
+      csrfToken: cookies && cookies.JSESSIONID,
+      videoUrl,
+      account: state.account,
+      enterpriseIdentity: state.enterpriseIdentity,
     });
+    if (upstream && upstream.enterpriseIdentity && !state.enterpriseIdentity) {
+      state.enterpriseIdentity = upstream.enterpriseIdentity;
+      await saveCheckpoint(state);
+    }
+    if (upstream && upstream.json && !state.account) {
+      const detected = detectEnterpriseAccount(upstream.json);
+      if (detected) {
+        state.account = detected;
+        await saveCheckpoint(state);
+        const retryAccountParam = `?u=${encodeURIComponent(state.account)}`;
+        let retryUrl = v.contentUrl || `https://www.linkedin.com/learning/${state.courseSlug}/${v.slug}`;
+        if (!retryUrl.includes('?')) retryUrl += retryAccountParam;
+        try {
+          await chrome.tabs.update(openedTabId, { url: retryUrl, active: false });
+          await waitForTabComplete(openedTabId);
+          await sleep(CONTENT_SCRIPT_SETTLE_MS);
+          upstream = await pageFetchWithReinject(openedTabId, {
+            courseSlug: state.courseSlug,
+            videoSlug: v.slug,
+            resolution: '_1080',
+            csrfToken: cookies && cookies.JSESSIONID,
+            videoUrl: retryUrl,
+            account: state.account,
+            enterpriseIdentity: state.enterpriseIdentity,
+          });
+          if (upstream && upstream.enterpriseIdentity && !state.enterpriseIdentity) {
+            state.enterpriseIdentity = upstream.enterpriseIdentity;
+            await saveCheckpoint(state);
+          }
+        } catch {}
+      }
+    }
   } catch (e) {
     upstream = { ok: false, error: `tab workflow failed: ${String(e && e.message || e)}` };
   } finally {
@@ -264,6 +340,16 @@ async function captureOne(state, i, cookies, persistentTabId) {
     if (openedTabId != null && openedTabOwnsLifecycle) {
       try { await chrome.tabs.remove(openedTabId); } catch { /* tab already gone */ }
     }
+  }
+
+  if (upstream && upstream.ok && upstream.build !== EXPECTED_CONTENT_BUILD) {
+    return {
+      slug: v.slug,
+      title: v.title,
+      status: 'failed',
+      fatal: true,
+      error: `the LinkedIn tab is still running content script build ${upstream.build || 'unknown'} instead of ${EXPECTED_CONTENT_BUILD} — reload the extension at chrome://extensions (it must show ${EXPECTED_CONTENT_BUILD}), then close the LinkedIn tabs and start the walk again`,
+    };
   }
 
   if (!upstream || !upstream.ok) {
@@ -276,10 +362,18 @@ async function captureOne(state, i, cookies, persistentTabId) {
       slug: v.slug,
       title: v.title,
       status: 'failed',
-      error: (upstream && upstream.error) || 'no upstream',
+      error: (upstream && (upstream.error || upstream.bodySnippet)) || 'no upstream',
       upstreamStatus: upstream ? upstream.status : null,
+      // Page-side fetch diagnostics: without these a "CSRF check failed." line
+      // looks identical no matter which request variant produced it.
+      upstreamBodySnippet: upstream ? upstream.bodySnippet : null,
+      pageFetchAttempts: upstream ? upstream.attempts : null,
+      pageFetchCount: upstream ? upstream.fetchCount : null,
+      tokenSource: upstream ? upstream.tokenSource : null,
+      usedEnterpriseIdentity: !!(upstream && upstream.usedEnterpriseIdentity),
       authFailure: !!(upstream && (upstream.status === 401 || upstream.status === 403)),
       rateLimited: !!(upstream && upstream.status === 429),
+      tabId: openedTabId,
     };
   }
 
@@ -313,11 +407,26 @@ async function captureOne(state, i, cookies, persistentTabId) {
     status: job.status || 'failed',
     file: job.file,
     error: job.error || (captureJson.error || null),
-    authFailure: !!(job.error && /401|403/.test(job.error)),
+    // Carry the page-fetch fingerprint into the capture path as well: without
+    // it a locked video logged "identity=no attempts=- fetches=-", which looked
+    // as if no header had been sent even when one had.
+    upstreamBodySnippet: upstream ? upstream.bodySnippet : null,
+    pageFetchAttempts: upstream ? upstream.attempts : null,
+    pageFetchCount: upstream ? upstream.fetchCount : null,
+    tokenSource: upstream ? upstream.tokenSource : null,
+    usedEnterpriseIdentity: !!(upstream && upstream.usedEnterpriseIdentity),
+    identitySource: upstream ? upstream.identitySource : null,
+    identityProblem: upstream ? upstream.identityProblem : null,
+    authFailure: !!(
+      (job.error && /401|403|csrf check failed/i.test(job.error)) ||
+      (upstream && (upstream.status === 401 || upstream.status === 403))
+    ),
+    rateLimited: !!(upstream && upstream.status === 429),
+    tabId: openedTabId,
   };
 }
 
-async function runWalk(courseSlug) {
+async function runWalk(courseSlug, account = null, identity = null) {
   const cookies = await readLinkedInCookies();
   if (!cookies.li_at) {
     setBadge('login missing', 'error');
@@ -337,6 +446,8 @@ async function runWalk(courseSlug) {
 
   let state = await loadCheckpoint(courseSlug);
   if (state) {
+    if (!state.account && account) state.account = account;
+    if (!state.enterpriseIdentity && identity) state.enterpriseIdentity = identity;
     // On resume, the original resolution wins (captures done at a different
     // ceiling can't be re-picked without re-downloading).
     setBadge(`resuming at ${state.cursor + 1}`, 'warn');
@@ -353,11 +464,14 @@ async function runWalk(courseSlug) {
     }
     state = {
       courseSlug,
+      account,
+      enterpriseIdentity: identity || null,
       courseTitle: course.courseTitle || courseSlug,
       videos: course.videos.map((v) => ({
         slug: v.slug,
         title: v.title,
         chapterTitle: v.chapterTitle,
+        contentUrl: v.contentUrl || null,
       })),
       results: [],
       cursor: 0,
@@ -376,8 +490,13 @@ async function runWalk(courseSlug) {
     // Single tab for the whole walk — see captureOne(). The first video's
     // URL seeds it so we don't waste an extra navigation.
     const firstVideo = state.videos[state.cursor];
+    const accountParam = state.account ? `?u=${encodeURIComponent(state.account)}` : '';
+    let initialUrl = firstVideo.contentUrl || `https://www.linkedin.com/learning/${state.courseSlug}/${firstVideo.slug}`;
+    if (state.account && !initialUrl.includes('?')) {
+      initialUrl += accountParam;
+    }
     const created = await chrome.tabs.create({
-      url: `https://www.linkedin.com/learning/${state.courseSlug}/${firstVideo.slug}`,
+      url: initialUrl,
       active: false,
     });
     persistentTabId = created.id;
@@ -432,6 +551,9 @@ async function runWalk(courseSlug) {
         }
         setBadge(`retrying ${i + 1}/${state.videos.length}`, 'warn');
       }
+      if (result && result.tabId && persistentTabId !== result.tabId) {
+        persistentTabId = result.tabId;
+      }
       state.results[i] = result;
       // Checkpoint AFTER the video so a crash re-runs at most one video. The
       // server's already-on-disk check makes a repeat cheap.
@@ -443,18 +565,66 @@ async function runWalk(courseSlug) {
       // Mirror the per-video outcome to the server log so silent skips surface
       // in `_logs/linkedinrec.log` instead of vanishing into the runner's UI.
       if (result.status !== 'done' && result.status !== 'already_done') {
+        const extensionVersion = (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '?';
+        const detail = [
+          `v=${extensionVersion}`,
+          `status=${result.upstreamStatus == null ? '-' : result.upstreamStatus}`,
+          `attempts=${result.pageFetchAttempts == null ? '-' : result.pageFetchAttempts}`,
+          `fetches=${result.pageFetchCount == null ? '-' : result.pageFetchCount}`,
+          `token=${result.tokenSource || '-'}`,
+          `identity=${result.usedEnterpriseIdentity ? 'yes' : 'no'}`,
+          `identitySrc=${result.identitySource || '-'}`,
+          ...(result.identityProblem ? [`identityProblem=${JSON.stringify(result.identityProblem)}`] : []),
+          `body=${JSON.stringify(String(result.upstreamBodySnippet || '').slice(0, 120))}`,
+        ].join(' ');
         await reportRunnerOutcome(state.courseSlug, state.videos[i].slug, i + 1, state.videos.length,
-          result.status || 'unknown', result.error || null, result.upstreamStatus || null);
+          result.status || 'unknown', result.error || null, result.upstreamStatus || null, detail);
       }
 
       // Light pacing between successful iterations. 429 backoff is now handled
       // inside the retry loop above, so this just keeps us polite.
       await sleep(DEFAULT_INTER_VIDEO_DELAY_MS);
 
-      if (result.authFailure) {
-        setBadge('auth failure — aborted', 'error');
-        els.current.textContent = `${result.error} (re-open linkedin.com/learning to refresh the session, then reopen this walk to resume)`;
+      if (result && result.fatal) {
+        // Environment problem (stale extension build): every remaining video
+        // would fail identically, so stop immediately with the instruction.
+        setBadge('extension stale — aborted', 'error');
+        els.current.textContent = result.error;
         return;
+      }
+
+      const notEntitled = /subscription-required|not accessible/i.test(String((result && result.error) || ''));
+      if (notEntitled) {
+        // The account has no access to this video (LinkedIn: accessible=false /
+        // course LOCKED). Refreshing cookies or retrying cannot change that and
+        // every remaining video would fail the same way, so stop and say why
+        // instead of walking 60+ videos just to fail on each one.
+        setBadge('no access — aborted', 'error');
+        els.current.textContent = `${result.error}. Stopped at video ${i + 1}/${state.videos.length}; already captured files are kept. Check that the LinkedIn account has access to this course, then reopen this walk.`;
+        return;
+      }
+
+      if (result.authFailure) {
+        // Try one immediate retry with fresh cookies and a fresh persistent tab
+        // before declaring a hard auth failure.
+        setBadge(`auth check failed on video ${i + 1} — refreshing session…`, 'warn');
+        await sleep(1500);
+        cookies = await readLinkedInCookies();
+        if (persistentTabId != null) {
+          try { await chrome.tabs.remove(persistentTabId); } catch {}
+          persistentTabId = null;
+        }
+        result = await captureOne(state, i, cookies, null);
+        if (result && result.tabId) persistentTabId = result.tabId;
+        state.results[i] = result;
+        await saveCheckpoint(state);
+        renderProgress(state);
+        renderList(state);
+        if (result.authFailure) {
+          setBadge('auth failure — aborted', 'error');
+          els.current.textContent = `${result.error} (re-open linkedin.com/learning to refresh the session, then reopen this walk to resume)`;
+          return;
+        }
       }
     }
 
@@ -490,7 +660,10 @@ els.reset.addEventListener('click', async () => {
 });
 
 (async () => {
-  const courseSlug = new URLSearchParams(location.search).get('course');
+  const searchParams = new URLSearchParams(location.search);
+  const courseSlug = searchParams.get('course');
+  const account = searchParams.get('account') || searchParams.get('u') || null;
+  const identity = searchParams.get('identity') || searchParams.get('x-li-identity') || null;
   if (!courseSlug) {
     setBadge('no course', 'error');
     els.current.textContent = 'missing ?course=<slug> in the URL';
@@ -498,7 +671,7 @@ els.reset.addEventListener('click', async () => {
   }
   els.course.textContent = courseSlug;
   try {
-    await runWalk(courseSlug);
+    await runWalk(courseSlug, account, identity);
   } catch (e) {
     setBadge('crashed', 'error');
     els.current.textContent = String(e && e.message || e);

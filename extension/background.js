@@ -5,6 +5,54 @@
 const SERVER = 'http://localhost:5177';
 
 const LINKEDIN_COOKIE_DOMAIN = '.linkedin.com';
+const IDENTITY_KEY = 'linkedinrec.xli';
+const IDENTITY_MAX = 8192;
+
+// Corporate/enterprise ("connected") accounts get a locked detailedCourses
+// response — only the first videos of a course carry playback URLs, everything
+// else comes back accessible:false — unless the request carries the account's
+// `x-li-identity` header. The value is per session and each account has its
+// own, so it is pasted once from DevTools and kept in storage.local (never
+// synced, never sent anywhere except to linkedin.com).
+// Rejects the mistakes that used to be invisible: a pasted "x-li-identity: …"
+// line, a value with whitespace/line breaks, or an obviously wrong literal.
+// Returns { value } or { error } with a message the popup can show.
+function normalizeIdentity(raw) {
+  const value = String(raw == null ? '' : raw).trim().replace(/^["']+|["']+$/g, '');
+  if (!value) return { value: null };
+  if (/\s/.test(value)) return { error: 'the value contains whitespace — paste only the header value, not "x-li-identity: …"' };
+  if (!/^[\x21-\x7E]+$/.test(value)) return { error: 'the value contains non-ASCII characters — copy it again from the request headers' };
+  if (!/[A-Za-z0-9]/.test(value)) return { error: 'the value has no letters or digits — that is not a header value' };
+  if (/^(?:true|false|null|undefined|!0|!1)$/i.test(value)) return { error: 'that looks like a JavaScript literal, not the header value' };
+  if (value.length < 8) return { error: `the value is too short (${value.length} chars) — copy the whole header value` };
+  if (value.length > IDENTITY_MAX) return { error: `the value is too long (${value.length} chars, max ${IDENTITY_MAX})` };
+  return { value };
+}
+
+async function readEnterpriseIdentity() {
+  try {
+    const bag = await chrome.storage.local.get(IDENTITY_KEY);
+    const raw = bag && bag[IDENTITY_KEY];
+    if (!raw || !String(raw).trim()) return { identity: null, problem: null };
+    const normalized = normalizeIdentity(raw);
+    if (normalized.error) return { identity: null, problem: `stored header rejected: ${normalized.error}` };
+    return { identity: normalized.value, problem: null };
+  } catch (e) {
+    return { identity: null, problem: `could not read the saved header: ${e && e.message ? e.message : e}` };
+  }
+}
+
+async function writeEnterpriseIdentity(raw) {
+  const value = raw == null ? '' : String(raw).trim();
+  if (!value) {
+    await chrome.storage.local.remove(IDENTITY_KEY);
+    return { ok: true, identity: null, cleared: true };
+  }
+  const normalized = normalizeIdentity(value);
+  if (normalized.error) return { ok: false, error: normalized.error };
+  await chrome.storage.local.set({ [IDENTITY_KEY]: normalized.value });
+  return { ok: true, identity: normalized.value };
+}
 
 async function pingServer() {
   try {
@@ -20,7 +68,7 @@ async function pingServer() {
 // and cookie jar as the page itself — LinkedIn's edge can't fingerprint it as
 // out-of-band. We fall back to the server-side path if no LinkedIn tab is open
 // (e.g. captures triggered programmatically).
-async function fetchDetailedCoursesFromActiveTab({ courseSlug, videoSlug, resolution }) {
+async function fetchDetailedCoursesFromActiveTab({ courseSlug, videoSlug, resolution, account, csrfToken, enterpriseIdentity }) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !tab.url || !/linkedin\.com\/learning/.test(tab.url)) {
     return { ok: false, error: 'no active linkedin.com/learning tab' };
@@ -31,6 +79,9 @@ async function fetchDetailedCoursesFromActiveTab({ courseSlug, videoSlug, resolu
       courseSlug,
       videoSlug,
       resolution,
+      account,
+      csrfToken,
+      enterpriseIdentity,
     });
     return resp;
   } catch (e) {
@@ -39,14 +90,24 @@ async function fetchDetailedCoursesFromActiveTab({ courseSlug, videoSlug, resolu
 }
 
 async function readLinkedInCookies() {
-  // chrome.cookies.getAll with domain = '.linkedin.com' returns every cookie
-  // visible to the extension. We only need li_at + JSESSIONID; everything else
-  // is ignored.
-  const all = await chrome.cookies.getAll({ domain: LINKEDIN_COOKIE_DOMAIN });
+  // Query cookies for linkedin.com: try specific url first, fallback to broad domain.
+  let all = [];
+  try {
+    all = await chrome.cookies.getAll({ url: 'https://www.linkedin.com' });
+  } catch {}
+  if (!all || !all.length) {
+    try {
+      all = await chrome.cookies.getAll({ domain: 'linkedin.com' });
+    } catch {}
+  }
   const map = {};
   for (const c of all) {
     if (c.name === 'li_at' || c.name === 'JSESSIONID') {
-      map[c.name] = c.value;
+      const val = c.value ? String(c.value).replace(/^"|"$/g, '') : '';
+      // Prefer host-specific (www.linkedin.com) or exact match over generic subdomain
+      if (!map[c.name] || (c.domain && c.domain.startsWith('www.'))) {
+        map[c.name] = val;
+      }
     }
   }
   return map;
@@ -62,9 +123,11 @@ function parseLearningUrl(url) {
     if (parts[0] !== 'learning') return null;
     const courseSlug = parts[1] || null;
     const videoSlug = parts[2] || null;
+    const account = u.searchParams.get('u') || u.searchParams.get('account') || null;
     return {
       courseSlug,
       videoSlug,
+      account,
       isCourseRoot: !!courseSlug && !videoSlug,
       isVideo: !!courseSlug && !!videoSlug,
     };
@@ -97,6 +160,9 @@ async function captureActiveVideo() {
     courseSlug: parsed.courseSlug,
     videoSlug: parsed.videoSlug,
     resolution: '_1080',
+    account: parsed.account,
+    csrfToken: cookies && cookies.JSESSIONID,
+    enterpriseIdentity: (await readEnterpriseIdentity()).identity,
   });
   if (!upstream || !upstream.ok) {
     return {
@@ -153,8 +219,11 @@ async function captureEntireCourse() {
   if (!cookies.li_at) {
     return { ok: false, error: 'no li_at cookie — log into linkedin.com in this browser first' };
   }
+  const accountQuery = parsed.account ? `&u=${encodeURIComponent(parsed.account)}` : '';
+  const identity = (await readEnterpriseIdentity()).identity;
+  const identityQuery = identity ? `&identity=${encodeURIComponent(identity)}` : '';
   const runnerUrl = chrome.runtime.getURL(
-    `runner.html?course=${encodeURIComponent(parsed.courseSlug)}`,
+    `runner.html?course=${encodeURIComponent(parsed.courseSlug)}${accountQuery}${identityQuery}`,
   );
   // Reuse an existing runner tab for this course if one is already open, so a
   // double-click doesn't start two competing walks. Filter in code — passing a
@@ -192,6 +261,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         case 'GET_COOKIES':
           sendResponse({ ok: true, cookies: await readLinkedInCookies() });
+          return;
+        case 'GET_IDENTITY': {
+          const state = await readEnterpriseIdentity();
+          sendResponse({ ok: true, identity: state.identity, problem: state.problem });
+          return;
+        }
+        case 'SET_IDENTITY':
+          sendResponse(await writeEnterpriseIdentity(msg.value));
           return;
         case 'PARSE_URL': {
           const parsed = parseLearningUrl(msg.url || '');

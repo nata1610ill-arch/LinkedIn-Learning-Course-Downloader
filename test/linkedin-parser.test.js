@@ -109,3 +109,104 @@ test('extractVideoMetadata surfaces transcriptLines', () => {
   assert.equal(md.progressiveUrl, 'https://cdn/v.mp4');
   assert.deepEqual(md.transcriptLines, [{ startMs: 0, caption: 'hi' }]);
 });
+
+test('extractVideoMetadata resolves video directly in included by slug', () => {
+  const json = {
+    included: [
+      { slug: 'course-container' },
+      {
+        slug: 'tunnelblick',
+        title: 'Tunnelblick',
+        formats: [{ type: 'progressive', url: 'https://cdn/tunnelblick.mp4', height: 720 }],
+      },
+    ],
+  };
+  const md = extractVideoMetadata(json, 'course-container', 'tunnelblick');
+  assert.ok(md);
+  assert.equal(md.progressiveUrl, 'https://cdn/tunnelblick.mp4');
+  assert.equal(md.title, 'Tunnelblick');
+});
+
+test('extractVideoMetadata resolves URN pointers in normalized json', () => {
+  const json = {
+    included: [
+      {
+        slug: 'my-course',
+        '*selectedVideo': 'urn:li:lyndaVideo:999',
+      },
+      {
+        entityUrn: 'urn:li:lyndaVideo:999',
+        slug: 'target-video',
+        title: 'Target Video',
+        formats: [{ type: 'progressive', url: 'https://cdn/target.mp4', height: 1080 }],
+      },
+    ],
+  };
+  const md = extractVideoMetadata(json, 'my-course', 'target-video');
+  assert.ok(md);
+  assert.equal(md.progressiveUrl, 'https://cdn/target.mp4');
+  assert.equal(md.title, 'Target Video');
+});
+
+test('extractVideoMetadata detects locked state on selected video without progressiveUrl', () => {
+  const json = {
+    included: [
+      {
+        slug: 'course',
+        selectedVideo: {
+          slug: 'locked-video',
+          title: 'Locked Video',
+          isLocked: true,
+          lockedState: 'LOCKED',
+        },
+      },
+    ],
+  };
+  const md = extractVideoMetadata(json, 'course', 'locked-video');
+  assert.ok(md);
+  assert.equal(md.locked, true);
+  assert.equal(md.progressiveUrl, null);
+  assert.equal(md.title, 'Locked Video');
+});
+
+test('extractVideoMetadata detects locked state when accessible is false', () => {
+  const json = {
+    included: [
+      {
+        slug: 'course',
+        selectedVideo: {
+          slug: 'locked-video',
+          title: 'Locked Video',
+          accessible: false,
+          formats: [{ extension: 'MP4', width: 960, height: 540 }],
+        },
+      },
+    ],
+  };
+  const md = extractVideoMetadata(json, 'course', 'locked-video');
+  assert.ok(md);
+  assert.equal(md.locked, true);
+  assert.equal(md.notAccessible, true);
+  assert.equal(md.progressiveUrl, null);
+  assert.equal(md.title, 'Locked Video');
+});
+
+test('extractVideoMetadata detects locked state when fullCourseUnlocked is false and no video urls', () => {
+  const json = {
+    included: [
+      {
+        slug: 'course',
+        fullCourseUnlocked: false,
+        selectedVideo: {
+          slug: 'locked-video',
+          title: 'Locked Video',
+          formats: [{ extension: 'MP4', width: 960, height: 540 }],
+        },
+      },
+    ],
+  };
+  const md = extractVideoMetadata(json, 'course', 'locked-video');
+  assert.ok(md);
+  assert.equal(md.locked, true);
+  assert.equal(md.progressiveUrl, null);
+});

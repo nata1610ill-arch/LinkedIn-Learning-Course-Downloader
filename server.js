@@ -164,9 +164,10 @@ async function fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution
     videoSlug,
   });
   const url = `${API_BASE}?${params.toString()}`;
+  const cleanJsid = cookies.JSESSIONID ? String(cookies.JSESSIONID).replace(/^"|"$/g, '') : '';
   const headers = {
     accept: 'application/vnd.linkedin.normalized+json+2.1',
-    'csrf-token': cookies.JSESSIONID || '',
+    'csrf-token': cleanJsid,
     'x-restli-protocol-version': '2.0.0',
     'x-li-lang': 'en_US',
     referer: `${REFERER_BASE}/${courseSlug}/${videoSlug}`,
@@ -174,7 +175,7 @@ async function fetchDetailedCourses({ courseSlug, videoSlug, cookies, resolution
   };
   const cookieHeader = [
     cookies.li_at && `li_at=${cookies.li_at}`,
-    cookies.JSESSIONID && `JSESSIONID=${cookies.JSESSIONID}`,
+    cleanJsid && `JSESSIONID="${cleanJsid}"`,
   ].filter(Boolean).join('; ');
   if (cookieHeader) headers.cookie = cookieHeader;
 
@@ -241,7 +242,9 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
       if (parsed) {
         if (parsed.locked) {
           job.status = 'drm_protected';
-          job.error = 'locked or subscription-required';
+          job.error = parsed.notAccessible
+            ? 'subscription-required: LinkedIn reports this video as not accessible (accessible=false / course LOCKED) — the signed-in account is not entitled to it (corporate/enterprise accounts: set the x-li-identity header in the extension popup and re-run)'
+            : 'locked or subscription-required';
           log('WARN', 'capture', 'locked', { jobId, videoSlug });
           return job;
         }
@@ -286,9 +289,72 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
           ? upstreamJson.elements.length : null;
         const incLen = upstreamJson && Array.isArray(upstreamJson.included)
           ? upstreamJson.included.length : null;
+        // Deep diagnostic: log $type values and slug fields in included[]
+        // so we can see exactly what LinkedIn returned.
+        const incTypes = upstreamJson && Array.isArray(upstreamJson.included)
+          ? [...new Set(upstreamJson.included.map((n) => n && n.$type).filter(Boolean))]
+          : null;
+        const incSlugs = upstreamJson && Array.isArray(upstreamJson.included)
+          ? upstreamJson.included
+              .filter((n) => n && (n.slug || (n.attributes && n.attributes.slug)))
+              .map((n) => n.slug || n.attributes.slug)
+              .slice(0, 10)
+          : null;
+        const dataKeys = upstreamJson && upstreamJson.data && typeof upstreamJson.data === 'object'
+          ? Object.keys(upstreamJson.data) : null;
+        const dataSlug = upstreamJson && upstreamJson.data
+          ? upstreamJson.data.slug || (upstreamJson.data.attributes && upstreamJson.data.attributes.slug) || null
+          : null;
+        const dataType = upstreamJson && upstreamJson.data ? upstreamJson.data.$type : null;
+        // Check for selectedVideo pointers in included
+        const incWithSelectedVideo = upstreamJson && Array.isArray(upstreamJson.included)
+          ? upstreamJson.included
+              .filter((n) => n && (n.selectedVideo || n['*selectedVideo'] || (n.attributes && (n.attributes.selectedVideo || n.attributes['*selectedVideo']))))
+              .map((n) => ({
+                slug: n.slug || (n.attributes && n.attributes.slug),
+                $type: n.$type,
+                hasSelectedVideo: !!(n.selectedVideo || (n.attributes && n.attributes.selectedVideo)),
+                hasSelectedVideoRef: !!(n['*selectedVideo'] || (n.attributes && n.attributes['*selectedVideo'])),
+              }))
+              .slice(0, 5)
+          : null;
+        // Check for video-related $id or entityUrn containing the videoSlug
+        const incMatchingVideoSlug = upstreamJson && Array.isArray(upstreamJson.included)
+          ? upstreamJson.included
+              .filter((n) => n && videoSlug && (
+                (n.$id && n.$id.includes(videoSlug)) ||
+                (n.entityUrn && n.entityUrn.includes(videoSlug)) ||
+                (n.urn && n.urn.includes(videoSlug))
+              ))
+              .map((n) => ({
+                $id: n.$id,
+                $type: n.$type,
+                entityUrn: n.entityUrn,
+                keys: Object.keys(n).slice(0, 15),
+              }))
+              .slice(0, 3)
+          : null;
         log('WARN', 'capture', 'upstream json had no metadata', {
           jobId, topKeys, elemLen, includedLen: incLen,
+          incTypes, incSlugs, dataKeys, dataSlug, dataType,
+          incWithSelectedVideo,
+          incMatchingVideoSlug,
         });
+        // Dump the upstream JSON for offline debugging (first failure only
+        // to avoid filling the disk on a 74-video walk).
+        const dumpPath = path.join(LOGS_DIR, `upstream-debug-${videoSlug}.json`);
+        try {
+          await writeFile(dumpPath, JSON.stringify(upstreamJson, null, 2), 'utf8');
+          log('INFO', 'capture', 'dumped upstream json for debugging', { jobId, dumpPath });
+        } catch (e) {
+          log('WARN', 'capture', 'dump write failed', { jobId, error: String(e && e.message || e) });
+        }
+        // Do not fall through to the Node-side ladder if upstreamJson was already provided:
+        // Node-side fetch triggers LinkedIn anti-abuse TLS abort / 403 CSRF check failure,
+        // which would overwrite this diagnostic with a false "JSESSIONID expired" error.
+        job.status = 'failed';
+        job.error = 'no metadata (upstream)';
+        return job;
       }
     }
     if (!meta) {
@@ -362,7 +428,9 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
 
         if (parsed.locked) {
           job.status = 'drm_protected';
-          job.error = 'locked or subscription-required';
+          job.error = parsed.notAccessible
+            ? 'subscription-required: LinkedIn reports this video as not accessible (accessible=false / course LOCKED) — the signed-in account is not entitled to it (corporate/enterprise accounts: set the x-li-identity header in the extension popup and re-run)'
+            : 'locked or subscription-required';
           log('WARN', 'capture', 'locked', { jobId, videoSlug });
           return job;
         }
@@ -442,9 +510,10 @@ async function captureVideo({ courseSlug, videoSlug, cookies, courseTitle, chapt
       accept: '*/*',
       referer: `${REFERER_BASE}/${courseSlug}/${videoSlug}`,
     };
+    const cleanJsid = cookies.JSESSIONID ? String(cookies.JSESSIONID).replace(/^"|"$/g, '') : '';
     const cookieHeader = [
       cookies.li_at && `li_at=${cookies.li_at}`,
-      cookies.JSESSIONID && `JSESSIONID=${cookies.JSESSIONID}`,
+      cleanJsid && `JSESSIONID="${cleanJsid}"`,
     ].filter(Boolean).join('; ');
     if (cookieHeader) headers.cookie = cookieHeader;
 
@@ -738,7 +807,7 @@ const server = createServer(async (req, res) => {
         return;
       }
       const body = JSON.parse((await readBody(req)) || '{}');
-      const { courseSlug, videoSlug, index, total, outcome, error: runnerError, upstreamStatus } = body;
+      const { courseSlug, videoSlug, index, total, outcome, error: runnerError, upstreamStatus, detail } = body;
       if (!courseSlug || !videoSlug) {
         send(res, 400, { ok: false, error: 'courseSlug and videoSlug required' });
         return;
@@ -750,6 +819,10 @@ const server = createServer(async (req, res) => {
         courseSlug, videoSlug, index, total,
         error: runnerError ? String(runnerError).slice(0, 240) : null,
         upstreamStatus: upstreamStatus != null ? Number(upstreamStatus) : null,
+        // Build/request fingerprint of the failing page-side fetch, so a
+        // "CSRF check failed." line is diagnosable without guessing which
+        // extension version or request variant produced it.
+        detail: detail ? String(detail).slice(0, 400) : null,
       });
       send(res, 200, { ok: true });
       return;

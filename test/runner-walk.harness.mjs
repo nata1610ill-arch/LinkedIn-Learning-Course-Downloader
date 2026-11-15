@@ -25,7 +25,8 @@ function makeEl() {
   return el;
 }
 
-function buildSandbox({ videos, storage, failAt = new Set(), rateLimitAt = new Set(), rateLimitRecoverAfter = new Map(), dieAt = null, resolutionSelect = '_1080' }) {
+function buildSandbox({ videos, storage, failAt = new Set(), rateLimitAt = new Set(), rateLimitRecoverAfter = new Map(), dieAt = null, resolutionSelect = '_1080', contentBuild = '1.0.17' }) {
+  const buildField = contentBuild ? { build: contentBuild } : {};
   const els = {};
   for (const id of ['status', 'course', 'progress', 'current', 'items', 'stop', 'reset', 'resolution']) {
     els[id] = makeEl();
@@ -92,12 +93,12 @@ function buildSandbox({ videos, storage, failAt = new Set(), rateLimitAt = new S
             rateLimitAtTracker.set(msg.videoSlug, attempts);
             const recoverAfter = rateLimitRecoverAfter.get(msg.videoSlug) || Infinity;
             if (attempts >= recoverAfter) {
-              return { ok: true, status: 200, json: { recovered: msg.videoSlug }, bodySnippet: '{}' };
+              return { ok: true, status: 200, json: { recovered: msg.videoSlug }, bodySnippet: '{}', ...buildField };
             }
             return { ok: false, status: 429, error: 'no upstream' };
           }
           if (failAt.has(msg.videoSlug)) return { ok: false, error: 'content-script unreachable: boom' };
-          return { ok: true, status: 200, json: { fake: msg.videoSlug }, bodySnippet: '{}' };
+          return { ok: true, status: 200, json: { fake: msg.videoSlug }, bodySnippet: '{}', ...buildField };
         },
       },
       scripting: {
@@ -341,6 +342,21 @@ const videos = Array.from({ length: 12 }, (_, i) => ({
   const v2Failures = runnerLog.filter((r) => r.videoSlug === 'v2' && r.outcome === 'failed');
   assert.ok(v2Failures.length > 0, `v2 should appear as failed after retry cap, got: ${JSON.stringify(v2Failures)}`);
   console.log('PASS 10  persistent 429 exhausts retry budget and continues');
+}
+
+// --- 11. stale content script aborts at once with a clear instruction ------
+// Chrome serves content scripts from the snapshot taken at the last extension
+// reload. A runner that has been fixed but a content script that has not would
+// otherwise fail on every video with a puzzling error (that is exactly what
+// produced the 403 "CSRF check failed." round trip).
+{
+  const storage = {};
+  const { captured, runnerLog, els } = await run({ videos, storage, contentBuild: null });
+  assert.equal(captured.length, 0, `a stale content script must not reach the server, got ${captured.length} captures`);
+  assert.match(els.status.textContent, /stale/i, `expected a stale-build badge, got: ${els.status.textContent}`);
+  assert.ok(runnerLog.some((r) => /reload the extension/.test(String(r.error || ''))),
+    `the runner-log entry should name the fix, got: ${JSON.stringify(runnerLog)}`);
+  console.log('PASS 11  stale content-script build aborts with a reload instruction');
 }
 
 console.log('\nall runner harness checks passed');

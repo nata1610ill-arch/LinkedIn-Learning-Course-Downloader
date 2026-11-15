@@ -275,6 +275,40 @@ Three failure modes have produced this historically. Always check
 | `WARN runner video failed \| upstreamStatus=429` | LinkedIn's edge throttled the request | Already mitigated by 1.0.9 (persistent tab) and 1.0.10 (retry-in-place with 15s/30s/60s backoff). If a video hits the retry cap and stays failed, the walk continues; click "Capture entire course" again to retry just it. |
 | Walk stops with no log line at all | Old MV3 service-worker 5-minute cap | Fixed in 1.0.5 — walk runs in `runner.html`, not the service worker. |
 
+### Corporate / enterprise accounts: the first two videos download, then everything is `LOCKED`
+
+**Exact symptoms — all three are the same root cause:**
+
+| Where | Exact text |
+|---|---|
+| Runner list | first videos `done`, then every remaining video: `subscription-required: LinkedIn reports this video as not accessible (accessible=false / course LOCKED) — the signed-in account is not entitled to it` |
+| `_logs/linkedinrec.log` | `INFO capture start` -> `INFO capture using upstream json from content script` (HTTP 200!) -> `WARN capture locked` -> `WARN runner video drm_protected` |
+| Upstream JSON (`_logs/upstream-debug-*.json`) | `courseVisibilityStatus: "LOCKED"`, `coursePurchased: false`, `fullCourseUnlocked: false`, `selectedVideo.accessible: false`, no `url`, `formats[]` only `{width: 960, height: 540, extension: "mp4"}` |
+| Second symptom of the same cause | downloads that *do* work are `resolution="640p"` — the free preview rendition |
+
+**Why:** on an enterprise/connected ("corporate") account the
+`/learning-api/detailedCourses` request must carry that account's
+`x-li-identity` header. Without it LinkedIn still answers `200`, but with a
+locked course — the first one or two videos of a course are the free
+previews, which is exactly why "2 videos download, then it stops".
+`subscription: "NONE"` and `coursePurchased: false` in that payload are
+**not** the problem: the entitlement comes from the enterprise account
+(`permissions` contains `HAS_FULL_CONTENT_ACCESS`), so the `drm_protected` /
+`subscription-required` verdict is misleading. Sending a *wrong* identity
+instead of none gives the other classic signature: `403` with body
+`CSRF check failed.` on the very first video.
+
+**Fix (>= 1.0.17):** the content script reads the identity out of the page's
+`InitialContext` block (the `bpr-guid-*` element llvd calls
+`enterpriseProfileHash`), tries `enterpriseProfileHash` ->
+`enterpriseIdentityHash` -> `identityToken`, each with and without the
+optional `u` parameter, and stops at the first value LinkedIn accepts. No
+manual step is needed; if the page exposes nothing usable, paste the value
+from DevTools (Network -> `learning-api` -> Request Headers ->
+`x-li-identity`) into the extension popup — a stored value wins over the
+page. `identity=yes identitySrc=...` in the log line proves which one was
+sent.
+
 ### "no resolution found" / jobs in `failed` status
 
 Check `_logs/linkedinrec.log`. Each failed job carries an `error` string.
